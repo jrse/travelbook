@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=travelbook
+Comment=Radar view for nearby POIs
+Exec=travelbook
+Icon=travelbook
+Terminal=false
+Categories=Utility;Maps;
