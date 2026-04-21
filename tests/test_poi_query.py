@@ -24,6 +24,17 @@ class TestPoiQuery(unittest.TestCase):
         self.assertIn('nwr["tourism"="hotel"](around:900,51.0,9.0);', query)
         self.assertNotIn('nwr["shop"="supermarket"](around:900,51.0,9.0);', query)
 
+    def test_query_can_append_extra_filters_for_drive_mode(self):
+        query = travelbook.build_overpass_query(
+            52.0,
+            13.0,
+            5000,
+            ['"amenity"="cafe"'],
+            extra_filters=['"place"="city"'],
+        )
+        self.assertIn('nwr["amenity"="cafe"](around:5000,52.0,13.0);', query)
+        self.assertIn('nwr["place"="city"](around:5000,52.0,13.0);', query)
+
 
 if __name__ == "__main__":
     unittest.main()

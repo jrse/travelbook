@@ -13,7 +13,10 @@ from travelbook_core import (
     APP_ID,
     CANVAS_PADDING,
     CATEGORY_COLORS,
+    CITY_POI_FILTERS,
+    CITY_POI_RADIUS_M,
     DEFAULT_RADIUS_M,
+    DRIVE_MODE_AVG_WINDOW_SECS,
     DIARY_APP_VERSION,
     INDICATOR_COLORS,
     MAX_RADIUS_M,
@@ -34,22 +37,26 @@ from travelbook_core import (
 from travelbook_providers import CompassProvider, GeoClueProvider
 from travelbook_services import (
     PoiFetchError,
+    average_speed_mps,
     assign_clusters,
     bearing_deg,
     calculate_speed_mps,
     calculate_navigation_info,
+    detect_travel_mode,
     diary_file_path,
     distance_m,
     derive_travel_heading,
     effective_query_radius,
     fetch_pois,
     infer_category,
+    is_city_poi,
     load_diary_entries,
     poi_refresh_distance,
     poi_refresh_interval,
     resolve_region,
     save_diary_entries,
     should_refresh_pois,
+    trim_location_samples,
 )
 from travelbook_widgets import NavigationArea, RadarArea
 
@@ -88,6 +95,9 @@ class TravelbookApp(Gtk.Window):
         self.current_location: Optional[Tuple[float, float]] = None
         self.current_location_ts: Optional[float] = None
         self.current_speed_mps: Optional[float] = None
+        self.avg_speed_mps: Optional[float] = None
+        self.travel_mode = "pedestrian"
+        self.location_samples: List[Tuple[float, Tuple[float, float]]] = []
         self.last_real_gps_location: Optional[Tuple[float, float]] = None
         self.last_real_gps_fix_ts: Optional[float] = None
         self.previous_location: Optional[Tuple[float, float]] = None
@@ -100,6 +110,8 @@ class TravelbookApp(Gtk.Window):
         self.fetch_in_progress = False
         self.reload_requested = False
         self.active_poi_query_location: Optional[Tuple[float, float]] = None
+        self.city_fetch_in_progress = False
+        self.active_city_query: Optional[Tuple[str, float, float]] = None
         self.region_fetch_in_progress = False
         self.location_source = "unknown"
         self.network_state = "unknown"
@@ -124,6 +136,9 @@ class TravelbookApp(Gtk.Window):
         self.category_colors: Dict[str, Tuple[float, float, float]] = {
             osm_filter: CATEGORY_COLORS[idx % len(CATEGORY_COLORS)] for idx, (_label, osm_filter, _enabled) in enumerate(POI_OPTIONS)
         }
+        for city_label, city_filter in CITY_POI_FILTERS:
+            self.category_labels[city_filter] = city_label
+            self.category_colors[city_filter] = (0.35, 0.78, 0.98)
 
         self.filter_lookup: Dict[Tuple[str, str], str] = {}
         for _label, osm_filter, _enabled in POI_OPTIONS:
@@ -202,8 +217,11 @@ class TravelbookApp(Gtk.Window):
         refresh_btn.connect("clicked", lambda *_: self._refresh_pois(force=True))
         self.zoom_label = Gtk.Label(label="Zoom: 1.00x")
         self.zoom_label.set_xalign(0.0)
+        self.mode_label = Gtk.Label(label="Modus: pedestrian")
+        self.mode_label.set_xalign(1.0)
         action_row.pack_start(refresh_btn, False, False, 0)
         action_row.pack_start(self.zoom_label, True, True, 0)
+        action_row.pack_start(self.mode_label, False, False, 0)
         controls.pack_start(action_row, False, False, 0)
 
         indicator_row = Gtk.Box(spacing=12)
@@ -243,9 +261,9 @@ class TravelbookApp(Gtk.Window):
         self.scroller.add(self.radar_area)
         radar_page.pack_start(self.scroller, True, True, 0)
 
-        poi_header = Gtk.Label(label="POIs im Auto-Radius")
-        poi_header.set_xalign(0.0)
-        radar_page.pack_start(poi_header, False, False, 0)
+        self.poi_header_label = Gtk.Label(label="POIs im Auto-Radius")
+        self.poi_header_label.set_xalign(0.0)
+        radar_page.pack_start(self.poi_header_label, False, False, 0)
 
         self.poi_listbox = Gtk.ListBox()
         self.poi_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -309,6 +327,25 @@ class TravelbookApp(Gtk.Window):
         self.nav_detail_label.set_line_wrap(True)
         self.nav_detail_label.set_selectable(True)
         nav_page.pack_start(self.nav_detail_label, False, False, 0)
+
+        self.city_table_status_label = Gtk.Label(label="Stadt-POIs: waehle eine Stadt im Radar.")
+        self.city_table_status_label.set_xalign(0.0)
+        self.city_table_status_label.set_line_wrap(True)
+        nav_page.pack_start(self.city_table_status_label, False, False, 0)
+
+        self.city_poi_store = Gtk.ListStore(str, str, str)
+        self.city_poi_tree = Gtk.TreeView(model=self.city_poi_store)
+        for idx, title in enumerate(("Name", "Kategorie", "Distanz")):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=idx)
+            column.set_resizable(True)
+            self.city_poi_tree.append_column(column)
+        self.city_poi_scroller = Gtk.ScrolledWindow()
+        self.city_poi_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.city_poi_scroller.set_min_content_height(140)
+        self.city_poi_scroller.set_max_content_height(220)
+        self.city_poi_scroller.add(self.city_poi_tree)
+        nav_page.pack_start(self.city_poi_scroller, False, True, 0)
 
         self.nav_link_button = Gtk.LinkButton.new_with_label("https://example.com", "POI im Browser öffnen")
         self.nav_link_button.set_no_show_all(True)
@@ -414,6 +451,7 @@ class TravelbookApp(Gtk.Window):
         self.research_page_idx = self.notebook.append_page(research_page, Gtk.Label(label="Research"))
         self._init_tab_menu()
         self._update_runtime_indicators()
+        self._update_mode_ui()
 
     def _on_notebook_switch_page(self, _notebook, _page, page_num: int):
         if hasattr(self, "tab_titles"):
@@ -466,8 +504,22 @@ class TravelbookApp(Gtk.Window):
         self.zoom_label.set_text(f"Zoom: {self.zoom_factor:.2f}x")
         self.radar_area.queue_draw()
 
+    def _update_mode_ui(self):
+        mode_text = "drive" if self.travel_mode == "drive" else "pedestrian"
+        radius = self.get_effective_query_radius()
+        self.mode_label.set_text(f"Modus: {mode_text} | Radius {radius} m")
+        if hasattr(self, "poi_header_label"):
+            suffix = " nur Staedte" if self.travel_mode == "drive" else ""
+            self.poi_header_label.set_text(f"POIs im Auto-Radius ({mode_text}{suffix})")
+
     def get_color_for_filter(self, filter_key: str) -> Tuple[float, float, float]:
         return self.category_colors.get(filter_key, UNKNOWN_COLOR)
+
+    def _clear_city_poi_table(self, message: str):
+        if not hasattr(self, "city_poi_store"):
+            return
+        self.city_poi_store.clear()
+        self.city_table_status_label.set_text(message)
 
     def _center_radar_view(self):
         def _center():
@@ -509,6 +561,8 @@ class TravelbookApp(Gtk.Window):
 
         editor_min = max(180, int(h * 0.34))
         self.diary_editor_scroller.set_min_content_height(editor_min)
+        self.city_poi_scroller.set_min_content_height(max(120, int(h * 0.16)))
+        self.city_poi_scroller.set_max_content_height(max(180, int(h * 0.24)))
 
     def _estimate_tab_bar_width(self) -> int:
         if not hasattr(self, "tab_titles"):
@@ -562,6 +616,8 @@ class TravelbookApp(Gtk.Window):
     def _on_category_toggled(self, widget: Gtk.CheckButton, key: str):
         self.categories[key] = widget.get_active()
         self.last_query_location = None
+        if is_city_poi(self.selected_poi):
+            self._refresh_city_pois_for_selection()
         self._refresh_pois(force=True)
 
     def _tick_heading(self):
@@ -608,7 +664,12 @@ class TravelbookApp(Gtk.Window):
                         self._set_status(f"{provider_error} Fallback im Profil setzen.")
                         self.previous_location = self.current_location
                         self.current_location = None
+                        self.current_speed_mps = None
+                        self.avg_speed_mps = None
+                        self.travel_mode = "pedestrian"
+                        self.location_samples = []
                         self.pois = []
+                        self._update_mode_ui()
                         self._update_runtime_indicators()
                         self.radar_area.queue_draw()
                         self._refresh_poi_list()
@@ -638,6 +699,7 @@ class TravelbookApp(Gtk.Window):
 
             self.previous_location = previous_location
             self.previous_location_ts = previous_location_ts
+            self._update_travel_metrics()
             travel_heading = derive_travel_heading(
                 self.previous_location,
                 self.current_location,
@@ -647,6 +709,7 @@ class TravelbookApp(Gtk.Window):
             if travel_heading is not None:
                 self.travel_heading_deg = travel_heading
 
+            self._update_mode_ui()
             self._update_runtime_indicators()
             self._refresh_pois(force=False)
             self._refresh_region_info(force=False)
@@ -657,6 +720,21 @@ class TravelbookApp(Gtk.Window):
             self._set_status("Interner Fehler im Update-Timer")
             self._update_runtime_indicators()
         return True
+
+    def _update_travel_metrics(self):
+        if self.current_location is None or self.current_location_ts is None:
+            self.avg_speed_mps = None
+            self.travel_mode = "pedestrian"
+            self.location_samples = []
+            return
+        if self.location_source == "gps":
+            self.location_samples.append((self.current_location_ts, self.current_location))
+            self.location_samples = trim_location_samples(self.location_samples, DRIVE_MODE_AVG_WINDOW_SECS)
+        self.avg_speed_mps = average_speed_mps(self.location_samples, DRIVE_MODE_AVG_WINDOW_SECS, self._distance_m)
+        previous_mode = self.travel_mode
+        self.travel_mode = detect_travel_mode(self.current_speed_mps, self.avg_speed_mps)
+        if previous_mode != self.travel_mode:
+            self.last_query_location = None
 
     def _refresh_region_info(self, force: bool):
         if self.current_location is None or self.region_fetch_in_progress:
@@ -959,12 +1037,27 @@ class TravelbookApp(Gtk.Window):
         self._update_runtime_indicators()
         lat, lon = self.current_location
         radius = query_radius
-        thread = threading.Thread(target=self._fetch_pois_thread, args=(lat, lon, radius), daemon=True)
+        include_cities = True
+        city_only = self.travel_mode == "drive"
+        thread = threading.Thread(
+            target=self._fetch_pois_thread,
+            args=(lat, lon, radius, include_cities, city_only),
+            daemon=True,
+        )
         thread.start()
 
-    def _fetch_pois_thread(self, lat: float, lon: float, radius: int):
+    def _fetch_pois_thread(self, lat: float, lon: float, radius: int, include_cities: bool, city_only: bool):
         try:
-            pois = fetch_pois(lat, lon, radius, self.categories, self.filter_lookup, self.category_labels)
+            pois = fetch_pois(
+                lat,
+                lon,
+                radius,
+                self.categories,
+                self.filter_lookup,
+                self.category_labels,
+                include_cities=include_cities,
+                city_only=city_only,
+            )
             GLib.idle_add(self._apply_pois, pois, (lat, lon))
         except PoiFetchError as exc:
             GLib.idle_add(self._fetch_failed, exc.user_message)
@@ -996,11 +1089,16 @@ class TravelbookApp(Gtk.Window):
         speed_text = "-"
         if self.current_speed_mps is not None:
             speed_text = f"{(self.current_speed_mps * 3.6):.1f} km/h"
+        avg_speed_text = "-"
+        if self.avg_speed_mps is not None:
+            avg_speed_text = f"{(self.avg_speed_mps * 3.6):.1f} km/h"
         self._set_status(
             f"{len(pois)} POIs im Auto-Radius {self.current_query_radius_m} m, "
-            f"Cluster: {len(self.clusters)}, Refresh ~{interval_s}s / {threshold}m, Speed {speed_text}"
+            f"Modus {self.travel_mode}, Cluster: {len(self.clusters)}, "
+            f"Refresh ~{interval_s}s / {threshold}m, Speed {speed_text}, Avg5m {avg_speed_text}"
         )
         self._set_poi_error("")
+        self._update_mode_ui()
         self._update_runtime_indicators()
         self.radar_area.queue_draw()
         self._refresh_poi_list()
@@ -1023,6 +1121,7 @@ class TravelbookApp(Gtk.Window):
 
     def select_poi(self, poi: Poi):
         self.selected_poi = poi
+        self._refresh_city_pois_for_selection()
         self._refresh_navigation_view()
         self.notebook.set_current_page(2)
 
@@ -1041,7 +1140,66 @@ class TravelbookApp(Gtk.Window):
         return self.travel_heading_deg
 
     def get_effective_query_radius(self) -> int:
-        return effective_query_radius(self.radius_m, MAX_RADIUS_M, self.current_speed_mps)
+        return effective_query_radius(self.radius_m, MAX_RADIUS_M, self.current_speed_mps, self.travel_mode)
+
+    def _refresh_city_pois_for_selection(self):
+        if not is_city_poi(self.selected_poi):
+            self.city_fetch_in_progress = False
+            self.active_city_query = None
+            self._clear_city_poi_table("Stadt-POIs: waehle eine Stadt im Radar.")
+            return
+        city = self.selected_poi
+        if city is None:
+            return
+        self.city_fetch_in_progress = True
+        self.active_city_query = (city.name, city.lat, city.lon)
+        self._clear_city_poi_table(f"Stadt-POIs fuer {city.name} werden geladen...")
+        thread = threading.Thread(
+            target=self._fetch_city_pois_thread,
+            args=(city.name, city.lat, city.lon),
+            daemon=True,
+        )
+        thread.start()
+
+    def _fetch_city_pois_thread(self, city_name: str, lat: float, lon: float):
+        try:
+            pois = fetch_pois(
+                lat,
+                lon,
+                CITY_POI_RADIUS_M,
+                self.categories,
+                self.filter_lookup,
+                self.category_labels,
+                include_cities=False,
+            )
+            GLib.idle_add(self._apply_city_pois, city_name, pois, lat, lon)
+        except PoiFetchError as exc:
+            GLib.idle_add(self._city_poi_fetch_failed, city_name, exc.user_message)
+        except Exception:
+            GLib.idle_add(self._city_poi_fetch_failed, city_name, "Stadt-POIs konnten nicht geladen werden.")
+
+    def _apply_city_pois(self, city_name: str, pois: List[Poi], lat: float, lon: float):
+        if self.active_city_query != (city_name, lat, lon):
+            return False
+        self.city_fetch_in_progress = False
+        self.city_poi_store.clear()
+        for poi in pois[:40]:
+            self.city_poi_store.append([poi.name, poi.category_label, f"{int(poi.distance_m)} m"])
+        if pois:
+            self.city_table_status_label.set_text(
+                f"Stadt-POIs in {city_name} ({min(len(pois), 40)} von {len(pois)} im Radius {CITY_POI_RADIUS_M} m)"
+            )
+        else:
+            self.city_table_status_label.set_text(f"Keine Stadt-POIs in {city_name} gefunden.")
+        return False
+
+    def _city_poi_fetch_failed(self, city_name: str, message: str):
+        if self.active_city_query is None or self.active_city_query[0] != city_name:
+            return False
+        self.city_fetch_in_progress = False
+        self.city_poi_store.clear()
+        self.city_table_status_label.set_text(message)
+        return False
 
     def _refresh_navigation_view(self):
         nav = self.get_navigation_info()
@@ -1056,6 +1214,7 @@ class TravelbookApp(Gtk.Window):
             self.nav_info_label.set_text(f"Distanz: - | Ziel oben | Turn: - | Richtung: {heading_text}")
             self.nav_detail_label.set_text("POI: -")
             self.nav_link_button.hide()
+            self._clear_city_poi_table("Stadt-POIs: waehle eine Stadt im Radar.")
         else:
             poi, distance, bearing, heading, turn = nav
             self.nav_target_label.set_text(f"Ziel: {poi.name} ({poi.category_label})")
@@ -1078,6 +1237,8 @@ class TravelbookApp(Gtk.Window):
                 self.nav_link_button.show()
             else:
                 self.nav_link_button.hide()
+            if not is_city_poi(poi):
+                self._clear_city_poi_table("Stadt-POIs: nur verfuegbar, wenn das Ziel eine Stadt ist.")
         self.navigation_area.queue_draw()
 
     @staticmethod

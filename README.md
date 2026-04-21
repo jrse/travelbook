@@ -2,9 +2,11 @@
 
 GTK-App fuer postmarketOS mit:
 - GPS-Ortung via GeoClue
-- OSM-POI-Suche ueber Overpass API im Radius bis max. 2000m
+- Automatischer Wechsel zwischen pedestrian mode und drive mode anhand der GPS-Geschwindigkeit
+- OSM-POI-Suche ueber Overpass API mit dynamischem Radius; Staedte sind standardmaessig als POIs aktiv, im drive mode werden nur Staedte gezeigt
 - Profilseite mit aktivierbaren POI-Kategorien
 - Scrollbarer Radar-Graph: aktuelle Position im Zentrum, POIs radial nach Distanz
+- Navigation zu Staedten mit separater POI-Tabelle fuer Ziele in der ausgewaehlten Stadt
 - Automatische Aktualisierung bei Positionsaenderung
 - App-Icon und Desktop-Entry enthalten
 

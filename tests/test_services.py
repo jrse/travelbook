@@ -6,19 +6,23 @@ from pathlib import Path
 from travelbook_core import Poi, compute_runtime_indicators, format_fix_age
 from travelbook_services import (
     PoiFetchError,
+    average_speed_mps,
     assign_clusters,
     calculate_speed_mps,
     calculate_navigation_info,
+    detect_travel_mode,
     derive_travel_heading,
     effective_query_radius,
     extract_poi_url,
     fetch_pois,
+    is_city_poi,
     load_diary_entries,
     poi_refresh_distance,
     poi_refresh_interval,
     resolve_region,
     save_diary_entries,
     should_refresh_pois,
+    trim_location_samples,
 )
 
 
@@ -177,6 +181,29 @@ class TestServices(unittest.TestCase):
         )
         self.assertEqual(5.0, speed)
 
+    def test_trim_location_samples_keeps_recent_window_only(self):
+        samples = [
+            (100.0, (48.1, 11.6)),
+            (250.0, (48.2, 11.6)),
+            (410.0, (48.3, 11.6)),
+        ]
+
+        trimmed = trim_location_samples(samples, 120.0, now_ts=410.0)
+        self.assertEqual([(410.0, (48.3, 11.6))], trimmed)
+
+    def test_average_speed_mps_uses_window_endpoints(self):
+        samples = [
+            (100.0, (48.1, 11.6)),
+            (200.0, (48.2, 11.6)),
+            (300.0, (48.3, 11.6)),
+        ]
+        speed = average_speed_mps(samples, 300.0, distance_fn=lambda *_args: 600.0)
+        self.assertEqual(3.0, speed)
+
+    def test_detect_travel_mode_switches_to_drive_on_high_average_speed(self):
+        self.assertEqual("drive", detect_travel_mode(1.0, 4.5))
+        self.assertEqual("pedestrian", detect_travel_mode(2.0, 2.5))
+
     def test_poi_refresh_interval_shortens_when_speed_increases(self):
         slow = poi_refresh_interval(1000, 2.0)
         fast = poi_refresh_interval(1000, 20.0)
@@ -188,6 +215,9 @@ class TestServices(unittest.TestCase):
         self.assertEqual(1000, effective_query_radius(1000, 2000, 1.0))
         self.assertEqual(1600, effective_query_radius(1000, 2000, 20.0))
         self.assertEqual(2000, effective_query_radius(1000, 2000, 80.0))
+
+    def test_effective_query_radius_uses_larger_drive_mode_base(self):
+        self.assertEqual(5000, effective_query_radius(1000, 2000, 1.0, "drive"))
 
     def test_should_refresh_pois_requires_significant_movement(self):
         close_by = (48.1003, 11.6000)
@@ -258,6 +288,86 @@ class TestServices(unittest.TestCase):
         self.assertEqual(10.0, bearing)
         self.assertEqual(350.0, heading)
         self.assertEqual(20.0, turn)
+
+    def test_fetch_pois_can_include_cities_in_general_results(self):
+        def fake_post(*_args, **_kwargs):
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Village Center", "place": "village"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(
+            48.1,
+            11.6,
+            5000,
+            {},
+            {},
+            {},
+            include_cities=True,
+            http_post=fake_post,
+            sleep_fn=lambda _seconds: None,
+        )
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Staedte", pois[0].category_label)
+        self.assertEqual("place:village", pois[0].category)
+        self.assertTrue(is_city_poi(pois[0]))
+
+    def test_fetch_pois_can_limit_drive_mode_to_cities_only(self):
+        def fake_post(*_args, **_kwargs):
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Village Center", "place": "village"},
+                        },
+                        {
+                            "type": "node",
+                            "id": 2,
+                            "lat": 48.1002,
+                            "lon": 11.6002,
+                            "tags": {"name": "Cafe", "amenity": "cafe"},
+                        },
+                    ]
+                }
+            )
+
+        pois = fetch_pois(
+            48.1,
+            11.6,
+            5000,
+            {'"place"="city"': True, '"place"="town"': True, '"place"="village"': True, '"amenity"="cafe"': True},
+            {
+                ("place", "city"): '"place"="city"',
+                ("place", "town"): '"place"="town"',
+                ("place", "village"): '"place"="village"',
+                ("amenity", "cafe"): '"amenity"="cafe"',
+            },
+            {
+                '"place"="city"': "Staedte",
+                '"place"="town"': "Staedte",
+                '"place"="village"': "Staedte",
+                '"amenity"="cafe"': "Cafes",
+            },
+            city_only=True,
+            http_post=fake_post,
+            sleep_fn=lambda _seconds: None,
+        )
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Village Center", pois[0].name)
+        self.assertTrue(is_city_poi(pois[0]))
 
     def test_derive_travel_heading_returns_bearing_for_significant_movement(self):
         heading = derive_travel_heading(

@@ -3,16 +3,21 @@ import math
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import requests
 
 from travelbook_core import (
     APP_ID,
+    CITY_POI_FILTERS,
     DBSCAN_EPSILON_M,
     DBSCAN_MIN_POINTS,
     DIARY_APP_VERSION,
+    DRIVE_MODE_AVG_WINDOW_SECS,
+    DRIVE_MODE_BASE_RADIUS_M,
+    DRIVE_MODE_MAX_RADIUS_M,
+    DRIVE_MODE_MIN_AVG_SPEED_MPS,
     GPS_SPEED_MIN_MOVE_M,
     MAX_VISIBLE_POI_RESULTS,
     POI_FETCH_BACKOFF_SECS,
@@ -31,6 +36,7 @@ from travelbook_core import (
     Cluster,
     Poi,
     build_overpass_query,
+    parse_filter,
 )
 
 
@@ -112,7 +118,7 @@ def save_diary_entries(
 
 
 def infer_category(tags: Dict[str, str]) -> str:
-    for key in ["amenity", "tourism", "shop", "leisure", "highway"]:
+    for key in ["amenity", "tourism", "shop", "leisure", "highway", "place"]:
         if key in tags:
             return f"{key}:{tags[key]}"
     return "unknown"
@@ -212,6 +218,47 @@ def calculate_speed_mps(
     return moved / delta_t
 
 
+def trim_location_samples(
+    samples: Sequence[Tuple[float, Tuple[float, float]]],
+    max_age_secs: float = DRIVE_MODE_AVG_WINDOW_SECS,
+    now_ts: Optional[float] = None,
+) -> List[Tuple[float, Tuple[float, float]]]:
+    if not samples:
+        return []
+    reference_ts = samples[-1][0] if now_ts is None else now_ts
+    cutoff = reference_ts - max_age_secs
+    return [(sample_ts, loc) for sample_ts, loc in samples if sample_ts >= cutoff]
+
+
+def average_speed_mps(
+    samples: Sequence[Tuple[float, Tuple[float, float]]],
+    window_secs: float = DRIVE_MODE_AVG_WINDOW_SECS,
+    distance_fn: Callable[[float, float, float, float], float] = distance_m,
+) -> Optional[float]:
+    windowed = trim_location_samples(samples, window_secs)
+    if len(windowed) < 2:
+        return None
+    start_ts, start_loc = windowed[0]
+    end_ts, end_loc = windowed[-1]
+    delta_t = end_ts - start_ts
+    if delta_t <= 0:
+        return None
+    moved = distance_fn(start_loc[0], start_loc[1], end_loc[0], end_loc[1])
+    return moved / delta_t
+
+
+def detect_travel_mode(
+    instant_speed_mps: Optional[float],
+    avg_speed_window_mps: Optional[float],
+    pedestrian_threshold_mps: float = DRIVE_MODE_MIN_AVG_SPEED_MPS,
+) -> str:
+    if avg_speed_window_mps is not None and avg_speed_window_mps >= pedestrian_threshold_mps:
+        return "drive"
+    if instant_speed_mps is not None:
+        return "pedestrian"
+    return "pedestrian"
+
+
 def assign_clusters(
     pois: List[Poi],
     radius_m: int,
@@ -307,7 +354,15 @@ def poi_refresh_distance(radius_m: int) -> float:
     return min(POI_REFRESH_MAX_MOVE_M, max(POI_REFRESH_MIN_MOVE_M, float(radius_m) * POI_REFRESH_RADIUS_FACTOR))
 
 
-def effective_query_radius(base_radius_m: int, max_radius_m: int, speed_mps: Optional[float]) -> int:
+def effective_query_radius(
+    base_radius_m: int,
+    max_radius_m: int,
+    speed_mps: Optional[float],
+    travel_mode: str = "pedestrian",
+) -> int:
+    if travel_mode == "drive":
+        base_radius_m = max(base_radius_m, DRIVE_MODE_BASE_RADIUS_M)
+        max_radius_m = max(max_radius_m, DRIVE_MODE_MAX_RADIUS_M)
     if speed_mps is None or speed_mps < POI_SPEED_EXTENSION_MIN_MPS:
         return min(base_radius_m, max_radius_m)
     extension = int(speed_mps * POI_SPEED_LOOKAHEAD_SECS)
@@ -353,14 +408,32 @@ def fetch_pois(
     categories: Dict[str, bool],
     filter_lookup: Dict,
     category_labels: Dict[str, str],
+    include_cities: bool = False,
+    city_only: bool = False,
     http_post=requests.post,
     sleep_fn=time.sleep,
 ) -> List[Poi]:
     active_filters = [filter_key for filter_key, enabled in categories.items() if enabled]
-    if not active_filters:
+    city_filter_lookup = {}
+    for _label, filter_text in CITY_POI_FILTERS:
+        parsed = parse_filter(filter_text)
+        if parsed is not None:
+            city_filter_lookup[parsed] = filter_text
+    city_labels = {filter_text: label for label, filter_text in CITY_POI_FILTERS}
+    city_filters = [filter_key for filter_key in active_filters if filter_key in city_labels]
+
+    if city_only:
+        active_filters = city_filters
+        extra_filters = []
+    else:
+        extra_filters = [
+            filter_key for _label, filter_key in CITY_POI_FILTERS if include_cities and filter_key not in active_filters
+        ]
+
+    if not active_filters and not extra_filters:
         return []
 
-    query = build_overpass_query(lat, lon, radius, active_filters)
+    query = build_overpass_query(lat, lon, radius, active_filters, extra_filters=extra_filters)
     data = None
     last_error: Optional[PoiFetchError] = None
     attempts = POI_FETCH_RETRY_COUNT + 1
@@ -431,7 +504,9 @@ def fetch_pois(
 
         bearing = bearing_deg(lat, lon, poi_lat, poi_lon)
         tags = element.get("tags", {})
-        filter_key = match_filter(filter_lookup, tags) or "unknown"
+        filter_key = match_filter(filter_lookup, tags) or match_filter(city_filter_lookup, tags) or "unknown"
+        if city_only and filter_key not in city_labels:
+            continue
         name = tags.get("name", f"{element.get('type', 'poi')} #{element.get('id', '?')}")
         results.append(
             Poi(
@@ -442,10 +517,16 @@ def fetch_pois(
                 bearing_deg=bearing,
                 category=infer_category(tags),
                 category_filter=filter_key,
-                category_label=category_labels.get(filter_key, "Andere"),
+                category_label=category_labels.get(filter_key, city_labels.get(filter_key, "Andere")),
                 url=extract_poi_url(tags),
             )
         )
 
     results.sort(key=lambda poi: poi.distance_m)
     return results[:MAX_VISIBLE_POI_RESULTS]
+
+
+def is_city_poi(poi: Optional[Poi]) -> bool:
+    if poi is None:
+        return False
+    return poi.category.startswith("place:") and poi.category_filter in {filter_text for _label, filter_text in CITY_POI_FILTERS}

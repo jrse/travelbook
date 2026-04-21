@@ -1,9 +1,13 @@
 import unittest
 
+from travelbook_core import COMPASS_HEADING_OFFSET_DEG
 from travelbook_providers import is_valid_gps_fix
 
 
 class TestProviders(unittest.TestCase):
+    def test_compass_heading_has_no_global_offset(self):
+        self.assertEqual(0.0, COMPASS_HEADING_OFFSET_DEG)
+
     def test_accepts_precise_gps_fix(self):
         self.assertTrue(is_valid_gps_fix("GPS", 12.0))
 

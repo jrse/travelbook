@@ -5,11 +5,19 @@ from typing import Dict, List, Optional, Tuple
 APP_ID = "org.postmarketos.travelbook"
 DEFAULT_RADIUS_M = 1000
 MAX_RADIUS_M = 2000
+DRIVE_MODE_BASE_RADIUS_M = 5000
+DRIVE_MODE_MAX_RADIUS_M = 12000
+DRIVE_MODE_AVG_WINDOW_SECS = 300
+DRIVE_MODE_MIN_AVG_SPEED_MPS = 4.0
+CITY_POI_RADIUS_M = 3000
 MIN_CANVAS_SIZE = 1200
 CANVAS_PADDING = 600
 MIN_ZOOM = 0.35
 MAX_ZOOM = 3.0
 POI_OPTIONS = [
+    ("Staedte", '"place"="city"', True),
+    ("Staedte", '"place"="town"', True),
+    ("Staedte", '"place"="village"', True),
     ("Restaurants", '"amenity"="restaurant"', True),
     ("Cafes", '"amenity"="cafe"', True),
     ("Museen", '"tourism"="museum"', True),
@@ -20,6 +28,11 @@ POI_OPTIONS = [
     ("Parks", '"leisure"="park"', True),
     ("Tankstellen", '"amenity"="fuel"', False),
     ("Bus-Haltestellen", '"highway"="bus_stop"', False),
+]
+CITY_POI_FILTERS = [
+    ("Staedte", '"place"="city"'),
+    ("Staedte", '"place"="town"'),
+    ("Staedte", '"place"="village"'),
 ]
 CATEGORY_COLORS = [
     (0.95, 0.31, 0.30),
@@ -38,7 +51,7 @@ CLUSTER_COLOR_STROKE = (1.00, 0.45, 0.88, 0.90)
 DBSCAN_MIN_POINTS = 3
 DBSCAN_EPSILON_M = 180.0
 DIARY_APP_VERSION = "0.1.0"
-COMPASS_HEADING_OFFSET_DEG = 180.0
+COMPASS_HEADING_OFFSET_DEG = 0.0
 REGION_REFRESH_MOVE_M = 500.0
 REGION_REFRESH_SECS = 120.0
 MAX_VISIBLE_POI_RESULTS = 120
@@ -103,12 +116,18 @@ def parse_filter(filter_text: str) -> Optional[Tuple[str, str]]:
 
 
 def build_overpass_query(
-    lat: float, lon: float, radius: int, selected_filters: Optional[List[str]] = None
+    lat: float,
+    lon: float,
+    radius: int,
+    selected_filters: Optional[List[str]] = None,
+    extra_filters: Optional[List[str]] = None,
 ) -> str:
     active_filters = selected_filters
     if active_filters is None:
         active_filters = [osm_filter for _label, osm_filter, _enabled in POI_OPTIONS]
     filters = [f"nwr[{osm_filter}](around:{radius},{lat},{lon});" for osm_filter in active_filters]
+    if extra_filters:
+        filters.extend(f"nwr[{osm_filter}](around:{radius},{lat},{lon});" for osm_filter in extra_filters)
     return "[out:json][timeout:20];(" + "".join(filters) + ");out center tags;"
 
 
