@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import date
 from pathlib import Path
 
@@ -29,12 +30,21 @@ from travelbook_services import (
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
+        self.text = ""
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self.payload
+
+
+def extract_query(data):
+    if isinstance(data, dict):
+        return data.get("data", "")
+    if isinstance(data, bytes):
+        return data.decode("utf-8")
+    return str(data)
 
 
 class TestServices(unittest.TestCase):
@@ -166,6 +176,132 @@ class TestServices(unittest.TestCase):
                 sleep_fn=lambda _seconds: None,
             )
         self.assertIn("Netzwerkverbindung", ctx.exception.user_message)
+
+    def test_fetch_pois_batches_large_filter_sets_and_deduplicates_results(self):
+        calls = {"queries": []}
+        categories = {f'"amenity"="test_{index}"': True for index in range(30)}
+        filter_lookup = {("amenity", f"test_{index}"): f'"amenity"="test_{index}"' for index in range(30)}
+        labels = {f'"amenity"="test_{index}"': f"Test {index}" for index in range(30)}
+
+        def fake_post(_url, data=None, **_kwargs):
+            calls["queries"].append(extract_query(data))
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Cafe", "amenity": "test_0"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+        self.assertEqual(2, len(calls["queries"]))
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Cafe", pois[0].name)
+
+    def test_fetch_pois_only_queries_selected_categories_without_city_expansion(self):
+        calls = {"queries": []}
+        categories = {
+            '"amenity"="cafe"': True,
+            '"tourism"="hotel"': False,
+            '"place"="city"': False,
+        }
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+
+        def fake_post(_url, data=None, **_kwargs):
+            calls["queries"].append(extract_query(data))
+            return FakeResponse({"elements": []})
+
+        fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, include_cities=False, http_post=fake_post)
+
+        self.assertEqual(1, len(calls["queries"]))
+        self.assertIn('nwr["amenity"="cafe"](around:1000,48.1,11.6);', calls["queries"][0])
+        self.assertNotIn('nwr["place"="city"](around:1000,48.1,11.6);', calls["queries"][0])
+
+    def test_fetch_pois_splits_406_batches_and_still_returns_results(self):
+        import requests
+
+        calls = {"queries": []}
+        categories = {f'"amenity"="test_{index}"': True for index in range(4)}
+        filter_lookup = {("amenity", f"test_{index}"): f'"amenity"="test_{index}"' for index in range(4)}
+        labels = {f'"amenity"="test_{index}"': f"Test {index}" for index in range(4)}
+
+        class Fake406Response:
+            status_code = 406
+
+        def fake_post(_url, data=None, **_kwargs):
+            query = extract_query(data)
+            calls["queries"].append(query)
+            if query.count("nwr[") > 1:
+                raise requests.HTTPError(response=Fake406Response())
+            test_index = int(query.split('test_')[1].split('"')[0])
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": test_index,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Split OK", "amenity": "test_0"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertGreater(len(calls["queries"]), 1)
+        self.assertEqual(4, len(pois))
+
+    def test_fetch_pois_logs_query_text(self):
+        categories = {'"amenity"="cafe"': True}
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+
+        def fake_post(_url, data=None, **_kwargs):
+            return FakeResponse({"elements": []})
+
+        with patch("travelbook_services.LOGGER.warning") as warning:
+            fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertEqual(2, warning.call_count)
+        log_args = warning.call_args_list[0][0]
+        self.assertEqual("POI query lat=%s lon=%s radius=%s filter_count=%s filters=%s\n%s", log_args[0])
+        self.assertEqual(48.1, log_args[1])
+        self.assertEqual(11.6, log_args[2])
+        self.assertEqual(1000, log_args[3])
+        self.assertEqual(1, log_args[4])
+        self.assertEqual(['"amenity"="cafe"'], log_args[5])
+        self.assertIn('nwr["amenity"="cafe"](around:1000,48.1,11.6);', log_args[6])
+        response_log_args = warning.call_args_list[1][0]
+        self.assertEqual("POI response status=%s body=%s", response_log_args[0])
+
+    def test_fetch_pois_posts_query_using_data_form_field_and_headers(self):
+        categories = {'"amenity"="cafe"': True}
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+        request_args = {}
+
+        def fake_post(_url, data=None, headers=None, **_kwargs):
+            request_args["data"] = data
+            request_args["headers"] = headers
+            return FakeResponse({"elements": []})
+
+        fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertEqual(
+            '[out:json][timeout:20];(nwr["amenity"="cafe"](around:1000,48.1,11.6););out center tags;',
+            request_args["data"]["data"],
+        )
+        self.assertEqual("application/json,text/plain;q=0.9,*/*;q=0.8", request_args["headers"]["Accept"])
+        self.assertIn("/poi-fetch", request_args["headers"]["User-Agent"])
 
     def test_poi_refresh_distance_scales_with_radius_but_stays_bounded(self):
         self.assertEqual(75.0, poi_refresh_distance(100))

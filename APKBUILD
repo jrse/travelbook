@@ -1,12 +1,12 @@
 # Maintainer: Your Name <you@example.com>
 pkgname=travelbook
 pkgver=0.1.0
-pkgrel=25
+pkgrel=26
 pkgdesc="GPS radar POI viewer using OpenStreetMap for postmarketOS"
 url="https://example.com/travelbook"
 arch="all"
 license="MIT"
-depends="python3 py3-requests py3-gobject3 py3-pydbus gtk+3.0 geoclue iio-sensor-proxy"
+depends="python3 py3-requests py3-gobject3 py3-pydbus gtk+3.0 geoclue iio-sensor-proxy font-dejavu"
 makedepends=""
 source="travelbook.py travelbook_core.py travelbook_providers.py travelbook_services.py travelbook_widgets.py travelbook.desktop travelbook.svg"
 builddir="$srcdir"

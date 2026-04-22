@@ -293,7 +293,14 @@ class TravelbookApp(Gtk.Window):
         profile_page.pack_start(row, False, False, 0)
 
         profile_page.pack_start(Gtk.Label(label="POI-Kategorien"), False, False, 0)
-        for _label, key, enabled in POI_OPTIONS:
+        primary_category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        extra_category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        primary_groups: Dict[str, List[str]] = {}
+        for label, key, enabled in POI_OPTIONS:
+            if enabled:
+                primary_groups.setdefault(label, []).append(key)
+                continue
+
             cb_row = Gtk.Box(spacing=8)
             color = self.get_color_for_filter(key)
             color_dot = Gtk.DrawingArea()
@@ -305,9 +312,39 @@ class TravelbookApp(Gtk.Window):
             cb.set_active(enabled)
             cb.connect("toggled", self._on_category_toggled, key)
             cb_row.pack_start(cb, True, True, 0)
-            profile_page.pack_start(cb_row, False, False, 0)
+            extra_category_box.pack_start(cb_row, False, False, 0)
 
-        self.profile_page_idx = self.notebook.append_page(profile_page, Gtk.Label(label="Profil"))
+        for label, keys in primary_groups.items():
+            cb_row = Gtk.Box(spacing=8)
+            color = self.get_color_for_filter(keys[0])
+            color_dot = Gtk.DrawingArea()
+            color_dot.set_size_request(12, 12)
+            color_dot.connect("draw", self._draw_color_dot, color)
+            cb_row.pack_start(color_dot, False, False, 0)
+
+            cb = Gtk.CheckButton(label=label)
+            cb.set_active(all(self.categories[key] for key in keys))
+            cb.connect("toggled", self._on_category_toggled, tuple(keys))
+            cb_row.pack_start(cb, True, True, 0)
+            primary_category_box.pack_start(cb_row, False, False, 0)
+
+        profile_page.pack_start(primary_category_box, False, False, 0)
+
+        if any(not enabled for _label, _key, enabled in POI_OPTIONS):
+            extra_expander = Gtk.Expander(label="Weitere POI-Kategorien")
+            extra_expander.set_expanded(False)
+            extra_scroller = Gtk.ScrolledWindow()
+            extra_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            extra_scroller.set_min_content_height(90)
+            extra_scroller.set_max_content_height(180)
+            extra_scroller.add(extra_category_box)
+            extra_expander.add(extra_scroller)
+            profile_page.pack_start(extra_expander, False, False, 0)
+
+        profile_scroller = Gtk.ScrolledWindow()
+        profile_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        profile_scroller.add(profile_page)
+        self.profile_page_idx = self.notebook.append_page(profile_scroller, Gtk.Label(label="Profil"))
 
         nav_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         nav_page.set_border_width(12)
@@ -613,8 +650,10 @@ class TravelbookApp(Gtk.Window):
         self._set_indicator_markup(self.network_indicator_label, "Network", *indicators["Network"])
         self._set_indicator_markup(self.loading_indicator_label, "Data", *indicators["Data"])
 
-    def _on_category_toggled(self, widget: Gtk.CheckButton, key: str):
-        self.categories[key] = widget.get_active()
+    def _on_category_toggled(self, widget: Gtk.CheckButton, key: object):
+        keys = (key,) if isinstance(key, str) else tuple(key)
+        for category_key in keys:
+            self.categories[category_key] = widget.get_active()
         self.last_query_location = None
         if is_city_poi(self.selected_poi):
             self._refresh_city_pois_for_selection()
@@ -1037,7 +1076,7 @@ class TravelbookApp(Gtk.Window):
         self._update_runtime_indicators()
         lat, lon = self.current_location
         radius = query_radius
-        include_cities = True
+        include_cities = False
         city_only = self.travel_mode == "drive"
         thread = threading.Thread(
             target=self._fetch_pois_thread,

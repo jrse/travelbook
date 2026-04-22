@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import time
 from datetime import date, datetime
@@ -45,6 +46,113 @@ class PoiFetchError(RuntimeError):
         super().__init__(user_message)
         self.user_message = user_message
         self.retryable = retryable
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+OVERPASS_FILTER_BATCH_SIZE = 24
+
+
+def _chunk_filters(filters: List[str], chunk_size: int) -> List[List[str]]:
+    return [filters[index:index + chunk_size] for index in range(0, len(filters), chunk_size)]
+
+
+def _post_overpass_query(
+    lat: float,
+    lon: float,
+    radius: int,
+    filters: List[str],
+    http_post,
+    sleep_fn,
+) -> Dict:
+    query = build_overpass_query(lat, lon, radius, filters)
+    LOGGER.warning(
+        "POI query lat=%s lon=%s radius=%s filter_count=%s filters=%s\n%s",
+        lat,
+        lon,
+        radius,
+        len(filters),
+        filters,
+        query,
+    )
+    data = None
+    last_error: Optional[PoiFetchError] = None
+    attempts = POI_FETCH_RETRY_COUNT + 1
+    for attempt in range(attempts):
+        try:
+            response = http_post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                headers={
+                    "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+                    "User-Agent": f"{APP_ID}/poi-fetch",
+                },
+                timeout=POI_FETCH_TIMEOUT_SECS,
+            )
+            response_text = str(getattr(response, "text", "") or "")
+            LOGGER.warning(
+                "POI response status=%s body=%s",
+                getattr(response, "status_code", "unknown"),
+                response_text[:1000].strip(),
+            )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except requests.Timeout:
+            last_error = PoiFetchError(
+                "POI-Abfrage hat das Zeitlimit erreicht. Bitte erneut versuchen.",
+                retryable=True,
+            )
+        except requests.ConnectionError:
+            last_error = PoiFetchError(
+                "Keine Netzwerkverbindung für POI-Abfrage.",
+                retryable=True,
+            )
+        except requests.HTTPError as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            response_text = str(getattr(getattr(exc, "response", None), "text", "") or "").strip()
+            if response_text:
+                LOGGER.warning("POI query failed status=%s response=%s", status_code, response_text[:1000])
+            if status_code in POI_FETCH_RETRYABLE_STATUS_CODES:
+                last_error = PoiFetchError(
+                    f"POI-Dienst antwortet gerade nicht stabil (HTTP {status_code}).",
+                    retryable=True,
+                )
+            elif status_code == 406 and len(filters) > 1:
+                midpoint = max(1, len(filters) // 2)
+                left = _post_overpass_query(lat, lon, radius, filters[:midpoint], http_post, sleep_fn)
+                right = _post_overpass_query(lat, lon, radius, filters[midpoint:], http_post, sleep_fn)
+                return {"elements": left.get("elements", []) + right.get("elements", [])}
+            elif status_code == 406:
+                last_error = PoiFetchError(
+                    "POI-Abfrage wurde vom Dienst abgelehnt (HTTP 406).",
+                    retryable=False,
+                )
+            elif status_code is not None:
+                last_error = PoiFetchError(
+                    f"POI-Abfrage wurde vom Dienst abgelehnt (HTTP {status_code}).",
+                    retryable=False,
+                )
+            else:
+                last_error = PoiFetchError("POI-Abfrage ist mit einem HTTP-Fehler fehlgeschlagen.", retryable=False)
+        except (ValueError, json.JSONDecodeError):
+            last_error = PoiFetchError("POI-Dienst lieferte eine ungueltige Antwort.", retryable=False)
+        except requests.RequestException:
+            last_error = PoiFetchError("POI-Abfrage ist aufgrund eines Netzwerkfehlers fehlgeschlagen.", retryable=True)
+
+        if last_error is None:
+            break
+        if not last_error.retryable or attempt >= attempts - 1:
+            raise last_error
+        if attempt < len(POI_FETCH_BACKOFF_SECS):
+            sleep_fn(POI_FETCH_BACKOFF_SECS[attempt])
+
+    if data is None:
+        raise last_error or PoiFetchError("POIs konnten nicht geladen werden.", retryable=False)
+    if not isinstance(data, dict):
+        raise PoiFetchError("POI-Dienst lieferte ein ungueltiges Datenformat.", retryable=False)
+    return data
 
 
 def resolve_region(lat: float, lon: float, http_get=requests.get) -> Dict[str, str]:
@@ -433,64 +541,24 @@ def fetch_pois(
     if not active_filters and not extra_filters:
         return []
 
-    query = build_overpass_query(lat, lon, radius, active_filters, extra_filters=extra_filters)
-    data = None
-    last_error: Optional[PoiFetchError] = None
-    attempts = POI_FETCH_RETRY_COUNT + 1
-    for attempt in range(attempts):
-        try:
-            response = http_post(
-                "https://overpass-api.de/api/interpreter",
-                data=query.encode("utf-8"),
-                headers={"Content-Type": "text/plain"},
-                timeout=POI_FETCH_TIMEOUT_SECS,
-            )
-            response.raise_for_status()
-            data = response.json()
-            break
-        except requests.Timeout:
-            last_error = PoiFetchError(
-                "POI-Abfrage hat das Zeitlimit erreicht. Bitte erneut versuchen.",
-                retryable=True,
-            )
-        except requests.ConnectionError:
-            last_error = PoiFetchError(
-                "Keine Netzwerkverbindung für POI-Abfrage.",
-                retryable=True,
-            )
-        except requests.HTTPError as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code in POI_FETCH_RETRYABLE_STATUS_CODES:
-                last_error = PoiFetchError(
-                    f"POI-Dienst antwortet gerade nicht stabil (HTTP {status_code}).",
-                    retryable=True,
-                )
-            elif status_code is not None:
-                last_error = PoiFetchError(
-                    f"POI-Abfrage wurde vom Dienst abgelehnt (HTTP {status_code}).",
-                    retryable=False,
-                )
-            else:
-                last_error = PoiFetchError("POI-Abfrage ist mit einem HTTP-Fehler fehlgeschlagen.", retryable=False)
-        except (ValueError, json.JSONDecodeError):
-            last_error = PoiFetchError("POI-Dienst lieferte eine ungueltige Antwort.", retryable=False)
-        except requests.RequestException:
-            last_error = PoiFetchError("POI-Abfrage ist aufgrund eines Netzwerkfehlers fehlgeschlagen.", retryable=True)
+    filter_batches = _chunk_filters(active_filters, OVERPASS_FILTER_BATCH_SIZE)
+    if not filter_batches:
+        filter_batches = [[]]
+    if extra_filters:
+        filter_batches[-1] = filter_batches[-1] + extra_filters
 
-        if last_error is None:
-            break
-        if not last_error.retryable or attempt >= attempts - 1:
-            raise last_error
-        if attempt < len(POI_FETCH_BACKOFF_SECS):
-            sleep_fn(POI_FETCH_BACKOFF_SECS[attempt])
-
-    if data is None:
-        raise last_error or PoiFetchError("POIs konnten nicht geladen werden.", retryable=False)
-    if not isinstance(data, dict):
-        raise PoiFetchError("POI-Dienst lieferte ein ungueltiges Datenformat.", retryable=False)
+    elements: List[Dict] = []
+    for batch_filters in filter_batches:
+        data = _post_overpass_query(lat, lon, radius, batch_filters, http_post, sleep_fn)
+        elements.extend(data.get("elements", []))
 
     results: List[Poi] = []
-    for element in data.get("elements", []):
+    seen_elements = set()
+    for element in elements:
+        element_key = (element.get("type"), element.get("id"))
+        if element_key in seen_elements:
+            continue
+        seen_elements.add(element_key)
         if "lat" in element and "lon" in element:
             poi_lat, poi_lon = float(element["lat"]), float(element["lon"])
         elif "center" in element:

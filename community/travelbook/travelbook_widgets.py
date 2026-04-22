@@ -13,7 +13,31 @@ from travelbook_core import (
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gtk, cairo  # noqa: E402
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gtk, Pango, PangoCairo, cairo  # noqa: E402
+
+
+def _draw_text(
+    widget: Gtk.DrawingArea,
+    cr: cairo.Context,
+    text: str,
+    x: float,
+    y: float,
+    *,
+    size: float,
+) -> None:
+    layout = widget.create_pango_layout(text)
+    description = Pango.FontDescription()
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        font_name = settings.get_property("gtk-font-name")
+        if font_name:
+            description = Pango.FontDescription(font_name)
+    description.set_absolute_size(int(size * Pango.SCALE))
+    layout.set_font_description(description)
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, layout)
 
 
 class RadarArea(Gtk.DrawingArea):
@@ -96,11 +120,9 @@ class RadarArea(Gtk.DrawingArea):
         cr.stroke()
 
         cr.set_source_rgb(0.60, 0.85, 0.72)
-        cr.set_font_size(12)
         for ratio in ring_ratios:
             dist = int(visible_radius_m * ratio)
-            cr.move_to(center + 6, center - (max_r * ratio) - 4)
-            cr.show_text(f"{dist} m")
+            _draw_text(self, cr, f"{dist} m", center + 6, center - (max_r * ratio) - 12, size=12)
 
         cr.set_source_rgb(0.15, 1.0, 0.25)
         cr.arc(center, center, 8, 0, 2 * math.pi)
@@ -110,10 +132,7 @@ class RadarArea(Gtk.DrawingArea):
 
         if not self.app.current_location:
             cr.set_source_rgb(0.8, 0.8, 0.8)
-            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            cr.set_font_size(18)
-            cr.move_to(center - 180, center + 40)
-            cr.show_text("Keine GPS-Position verfuegbar")
+            _draw_text(self, cr, "Keine GPS-Position verfuegbar", center - 180, center + 22, size=18)
             return
 
         for cluster in self.app.clusters:
@@ -163,10 +182,8 @@ class RadarArea(Gtk.DrawingArea):
                 cr.stroke()
 
             cr.set_source_rgb(1, 1, 1)
-            cr.set_font_size(12)
             label = poi.name[:20]
-            cr.move_to(x + 8, y - 6)
-            cr.show_text(label)
+            _draw_text(self, cr, label, x + 8, y - 14, size=12)
             self._projected_points.append((poi, x, y))
 
 
@@ -193,18 +210,14 @@ class NavigationArea(Gtk.DrawingArea):
         nav = self.app.get_navigation_info()
         if nav is None:
             cr.set_source_rgb(0.85, 0.85, 0.85)
-            cr.set_font_size(15)
-            cr.move_to(18, center_y)
-            cr.show_text("POI im Radar antippen fuer Navigation")
+            _draw_text(self, cr, "POI im Radar antippen fuer Navigation", 18, center_y - 10, size=15)
             return
 
         poi, _distance, _bearing, _heading, turn = nav
 
         cr.set_source_rgb(0.30, 0.75, 0.98)
-        cr.set_font_size(13)
         top_label = poi.name[:10] or "Ziel"
-        cr.move_to(center_x - 18, center_y - radius - 8)
-        cr.show_text(top_label)
+        _draw_text(self, cr, top_label, center_x - 18, center_y - radius - 18, size=13)
 
         angle = math.radians(turn - 90)
         tip_x = center_x + math.cos(angle) * (radius - 8)
