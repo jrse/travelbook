@@ -23,7 +23,10 @@ from travelbook_core import (
     MAX_ZOOM,
     MIN_CANVAS_SIZE,
     MIN_ZOOM,
+    OLLAMA_BASE_URL_DEFAULT,
+    OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
     POI_OPTIONS,
+    RADAR_HEADING_REDRAW_THRESHOLD_DEG,
     REGION_REFRESH_MOVE_M,
     REGION_REFRESH_SECS,
     UNKNOWN_COLOR,
@@ -36,6 +39,7 @@ from travelbook_core import (
 )
 from travelbook_providers import CompassProvider, GeoClueProvider
 from travelbook_services import (
+    DiaryImproveError,
     PoiFetchError,
     average_speed_mps,
     assign_clusters,
@@ -50,11 +54,14 @@ from travelbook_services import (
     fetch_pois,
     infer_category,
     is_city_poi,
+    improve_diary_entry,
     load_diary_entries,
+    load_app_settings,
     poi_refresh_distance,
     poi_refresh_interval,
     resolve_region,
     save_diary_entries,
+    save_app_settings,
     should_refresh_pois,
     trim_location_samples,
 )
@@ -63,7 +70,8 @@ from travelbook_widgets import NavigationArea, RadarArea
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, cairo  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, cairo  # noqa: E402
 
 WEBKIT_AVAILABLE = False
 WebKit2 = None
@@ -123,13 +131,22 @@ class TravelbookApp(Gtk.Window):
         self.diary_date = date.today()
         self.diary_entries: List[Dict] = []
         self.diary_edit_id: Optional[str] = None
+        self.tabs_collapsed: Optional[bool] = None
         self.radar_page_idx = -1
         self.profile_page_idx = -1
         self.nav_page_idx = -1
         self.diary_page_idx = -1
         self.research_page_idx = -1
-        self.diary_dir = Path.home() / ".local" / "share" / "travelbook" / "diary"
+        self.app_data_dir = Path.home() / ".local" / "share" / "travelbook"
+        self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self.diary_dir = self.app_data_dir / "diary"
         self.diary_dir.mkdir(parents=True, exist_ok=True)
+        self.app_settings = load_app_settings(self.app_data_dir)
+        self.ollama_base_url = self.app_settings.get("ollama_base_url", OLLAMA_BASE_URL_DEFAULT)
+        self.ollama_diary_system_prompt = self.app_settings.get(
+            "ollama_diary_system_prompt",
+            OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
+        )
 
         self.categories: Dict[str, bool] = {osm_filter: enabled for _label, osm_filter, enabled in POI_OPTIONS}
         self.category_labels: Dict[str, str] = {osm_filter: label for label, osm_filter, _ in POI_OPTIONS}
@@ -159,6 +176,24 @@ class TravelbookApp(Gtk.Window):
         GLib.timeout_add_seconds(2, self._tick_location)
         self._tick_heading()
         self._tick_location()
+
+    @staticmethod
+    def _set_scroller_height(scroller: Gtk.ScrolledWindow, min_height: int, max_height: Optional[int] = None):
+        target_max = min_height if max_height is None else max_height
+        if scroller.get_min_content_height() != int(min_height):
+            scroller.set_min_content_height(int(min_height))
+        if scroller.get_max_content_height() != int(target_max):
+            scroller.set_max_content_height(int(target_max))
+
+    def _mode_icon_path(self, mode: str) -> Path:
+        filename = "mode-drive.svg" if mode == "drive" else "mode-pedestrian.svg"
+        return Path(__file__).resolve().with_name(filename)
+
+    def _load_mode_icon(self, mode: str):
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(self._mode_icon_path(mode)), 18, 18, True)
+        except Exception:
+            return None
 
     def _on_destroy(self, *_):
         self.compass_provider.close()
@@ -202,6 +237,30 @@ class TravelbookApp(Gtk.Window):
         self.menu_button.set_no_show_all(True)
         self.top_nav_row.pack_start(self.menu_button, False, False, 0)
 
+        self.gps_indicator_label = Gtk.Label()
+        self.gps_indicator_label.set_xalign(0.0)
+        self.gps_indicator_label.set_use_markup(True)
+        self.gps_indicator_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.gps_indicator_label.set_width_chars(12)
+        self.gps_indicator_label.set_max_width_chars(16)
+        self.top_nav_row.pack_start(self.gps_indicator_label, False, False, 0)
+
+        self.network_indicator_label = Gtk.Label()
+        self.network_indicator_label.set_xalign(0.0)
+        self.network_indicator_label.set_use_markup(True)
+        self.network_indicator_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.network_indicator_label.set_width_chars(12)
+        self.network_indicator_label.set_max_width_chars(16)
+        self.top_nav_row.pack_start(self.network_indicator_label, False, False, 0)
+
+        self.loading_indicator_label = Gtk.Label()
+        self.loading_indicator_label.set_xalign(0.0)
+        self.loading_indicator_label.set_use_markup(True)
+        self.loading_indicator_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.loading_indicator_label.set_width_chars(14)
+        self.loading_indicator_label.set_max_width_chars(18)
+        self.top_nav_row.pack_start(self.loading_indicator_label, False, False, 0)
+
         self.notebook = Gtk.Notebook()
         self.notebook.set_scrollable(True)
         self.notebook.connect("switch-page", self._on_notebook_switch_page)
@@ -217,29 +276,13 @@ class TravelbookApp(Gtk.Window):
         refresh_btn.connect("clicked", lambda *_: self._refresh_pois(force=True))
         self.zoom_label = Gtk.Label(label="Zoom: 1.00x")
         self.zoom_label.set_xalign(0.0)
-        self.mode_label = Gtk.Label(label="Modus: pedestrian")
-        self.mode_label.set_xalign(1.0)
+        self.mode_box = Gtk.Box(spacing=4)
+        self.mode_icon = Gtk.Image()
+        self.mode_box.pack_start(self.mode_icon, False, False, 0)
         action_row.pack_start(refresh_btn, False, False, 0)
         action_row.pack_start(self.zoom_label, True, True, 0)
-        action_row.pack_start(self.mode_label, False, False, 0)
+        action_row.pack_start(self.mode_box, False, False, 0)
         controls.pack_start(action_row, False, False, 0)
-
-        indicator_row = Gtk.Box(spacing=12)
-        self.gps_indicator_label = Gtk.Label()
-        self.gps_indicator_label.set_xalign(0.0)
-        self.gps_indicator_label.set_use_markup(True)
-        indicator_row.pack_start(self.gps_indicator_label, True, True, 0)
-
-        self.network_indicator_label = Gtk.Label()
-        self.network_indicator_label.set_xalign(0.0)
-        self.network_indicator_label.set_use_markup(True)
-        indicator_row.pack_start(self.network_indicator_label, True, True, 0)
-
-        self.loading_indicator_label = Gtk.Label()
-        self.loading_indicator_label.set_xalign(0.0)
-        self.loading_indicator_label.set_use_markup(True)
-        indicator_row.pack_start(self.loading_indicator_label, True, True, 0)
-        controls.pack_start(indicator_row, False, False, 0)
 
         self.status_label = Gtk.Label(label="Starte GPS...")
         self.status_label.set_xalign(0.0)
@@ -292,6 +335,28 @@ class TravelbookApp(Gtk.Window):
         profile_page.pack_start(Gtk.Label(label="Manuelle Position (nur wenn GPS fehlt):"), False, False, 0)
         profile_page.pack_start(row, False, False, 0)
 
+        profile_page.pack_start(Gtk.Label(label="Ollama Basis-URL"), False, False, 0)
+        self.ollama_base_url_entry = Gtk.Entry()
+        self.ollama_base_url_entry.set_text(self.ollama_base_url)
+        profile_page.pack_start(self.ollama_base_url_entry, False, False, 0)
+
+        profile_page.pack_start(Gtk.Label(label="Ollama System-Prompt für Tagebuch"), False, False, 0)
+        self.ollama_prompt_view = Gtk.TextView()
+        self.ollama_prompt_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.ollama_prompt_view.set_vexpand(False)
+        self.ollama_prompt_view.set_hexpand(True)
+        self.ollama_prompt_view.get_buffer().set_text(self.ollama_diary_system_prompt)
+        self.ollama_prompt_scroller = Gtk.ScrolledWindow()
+        self.ollama_prompt_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.ollama_prompt_scroller.set_min_content_height(110)
+        self.ollama_prompt_scroller.set_max_content_height(170)
+        self.ollama_prompt_scroller.add(self.ollama_prompt_view)
+        profile_page.pack_start(self.ollama_prompt_scroller, False, True, 0)
+
+        ollama_save_btn = Gtk.Button(label="Ollama Einstellungen speichern")
+        ollama_save_btn.connect("clicked", self._on_ollama_settings_save)
+        profile_page.pack_start(ollama_save_btn, False, False, 0)
+
         profile_page.pack_start(Gtk.Label(label="POI-Kategorien"), False, False, 0)
         primary_category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         extra_category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -333,12 +398,10 @@ class TravelbookApp(Gtk.Window):
         if any(not enabled for _label, _key, enabled in POI_OPTIONS):
             extra_expander = Gtk.Expander(label="Weitere POI-Kategorien")
             extra_expander.set_expanded(False)
-            extra_scroller = Gtk.ScrolledWindow()
-            extra_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            extra_scroller.set_min_content_height(90)
-            extra_scroller.set_max_content_height(180)
-            extra_scroller.add(extra_category_box)
-            extra_expander.add(extra_scroller)
+            extra_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            extra_content.set_border_width(6)
+            extra_content.pack_start(extra_category_box, False, False, 0)
+            extra_expander.add(extra_content)
             profile_page.pack_start(extra_expander, False, False, 0)
 
         profile_scroller = Gtk.ScrolledWindow()
@@ -410,25 +473,34 @@ class TravelbookApp(Gtk.Window):
         next_btn.connect("clicked", self._on_diary_next_day)
         today_btn = Gtk.Button(label="Heute")
         today_btn.connect("clicked", self._on_diary_today)
+        diary_save_btn = Gtk.Button(label="Speichern")
+        diary_save_btn.connect("clicked", self._on_diary_save_entry)
         self.diary_date_label = Gtk.Label(label="-")
         self.diary_date_label.set_xalign(0.0)
         day_controls.pack_start(prev_btn, False, False, 0)
         day_controls.pack_start(next_btn, False, False, 0)
         day_controls.pack_start(today_btn, False, False, 0)
-        day_controls.pack_start(self.diary_date_label, True, True, 0)
+        self.diary_save_btn = diary_save_btn
+        day_controls.pack_start(self.diary_save_btn, False, False, 0)
         diary_page.pack_start(day_controls, False, False, 0)
+        diary_page.pack_start(self.diary_date_label, False, False, 0)
 
-        self.diary_listbox = Gtk.ListBox()
-        self.diary_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.diary_listbox.connect("row-selected", self._on_diary_row_selected)
-        self.diary_list_scroller = Gtk.ScrolledWindow()
-        self.diary_list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.diary_list_scroller.set_min_content_height(120)
-        self.diary_list_scroller.set_max_content_height(220)
-        self.diary_list_scroller.add(self.diary_listbox)
-        diary_page.pack_start(self.diary_list_scroller, False, True, 0)
+        diary_view_controls = Gtk.Box(spacing=6)
+        self.diary_editor_view_btn = Gtk.Button(label="Eintrag")
+        self.diary_editor_view_btn.connect("clicked", lambda *_: self._show_diary_editor())
+        self.diary_history_view_btn = Gtk.Button(label="Verlauf")
+        self.diary_history_view_btn.connect("clicked", lambda *_: self._show_diary_history())
+        diary_view_controls.pack_start(self.diary_editor_view_btn, False, False, 0)
+        diary_view_controls.pack_start(self.diary_history_view_btn, False, False, 0)
+        diary_page.pack_start(diary_view_controls, False, False, 0)
 
-        diary_page.pack_start(Gtk.Label(label="Neuer Eintrag"), False, False, 0)
+        self.diary_stack = Gtk.Stack()
+        self.diary_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.diary_stack.set_transition_duration(0)
+        self.diary_stack.set_vexpand(True)
+
+        diary_editor_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        diary_editor_page.pack_start(Gtk.Label(label="Neuer Eintrag"), False, False, 0)
         self.diary_textview = Gtk.TextView()
         self.diary_textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.diary_textview.set_vexpand(True)
@@ -438,16 +510,32 @@ class TravelbookApp(Gtk.Window):
         self.diary_editor_scroller.set_vexpand(True)
         self.diary_editor_scroller.set_hexpand(True)
         self.diary_editor_scroller.add(self.diary_textview)
-        diary_page.pack_start(self.diary_editor_scroller, True, True, 0)
+        diary_editor_page.pack_start(self.diary_editor_scroller, True, True, 0)
 
         diary_btn_row = Gtk.Box(spacing=8)
-        diary_save_btn = Gtk.Button(label="Eintrag speichern/aktualisieren")
-        diary_save_btn.connect("clicked", self._on_diary_save_entry)
-        diary_btn_row.pack_start(diary_save_btn, False, False, 0)
         diary_clear_btn = Gtk.Button(label="Eingabe leeren")
         diary_clear_btn.connect("clicked", self._on_diary_clear_edit)
-        diary_btn_row.pack_start(diary_clear_btn, False, False, 0)
-        diary_page.pack_start(diary_btn_row, False, False, 0)
+        self.diary_clear_btn = diary_clear_btn
+        diary_btn_row.pack_start(self.diary_clear_btn, False, False, 0)
+        diary_editor_page.pack_start(diary_btn_row, False, False, 0)
+
+        diary_history_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        diary_history_page.pack_start(Gtk.Label(label="Einträge dieses Tages"), False, False, 0)
+        self.diary_listbox = Gtk.ListBox()
+        self.diary_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.diary_listbox_row_selected_handler = self.diary_listbox.connect("row-selected", self._on_diary_row_selected)
+        self.diary_list_scroller = Gtk.ScrolledWindow()
+        self.diary_list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.diary_list_scroller.set_min_content_height(120)
+        self.diary_list_scroller.set_max_content_height(220)
+        self.diary_list_scroller.set_vexpand(True)
+        self.diary_list_scroller.set_hexpand(True)
+        self.diary_list_scroller.add(self.diary_listbox)
+        diary_history_page.pack_start(self.diary_list_scroller, True, True, 0)
+
+        self.diary_stack.add_named(diary_editor_page, "editor")
+        self.diary_stack.add_named(diary_history_page, "history")
+        diary_page.pack_start(self.diary_stack, True, True, 0)
 
         self.diary_page_idx = self.notebook.append_page(diary_page, Gtk.Label(label="Tagebuch"))
 
@@ -539,12 +627,15 @@ class TravelbookApp(Gtk.Window):
     def set_zoom(self, zoom: float):
         self.zoom_factor = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
         self.zoom_label.set_text(f"Zoom: {self.zoom_factor:.2f}x")
-        self.radar_area.queue_draw()
+        self.radar_area.schedule_draw()
 
     def _update_mode_ui(self):
         mode_text = "drive" if self.travel_mode == "drive" else "pedestrian"
         radius = self.get_effective_query_radius()
-        self.mode_label.set_text(f"Modus: {mode_text} | Radius {radius} m")
+        pixbuf = self._load_mode_icon(self.travel_mode)
+        if pixbuf is not None:
+            self.mode_icon.set_from_pixbuf(pixbuf)
+        self.mode_icon.set_tooltip_text(f"Modus: {mode_text} | Radius {radius} m")
         if hasattr(self, "poi_header_label"):
             suffix = " nur Staedte" if self.travel_mode == "drive" else ""
             self.poi_header_label.set_text(f"POIs im Auto-Radius ({mode_text}{suffix})")
@@ -572,7 +663,6 @@ class TravelbookApp(Gtk.Window):
         target = max(MIN_CANVAS_SIZE, max(allocation.width, allocation.height) + CANVAS_PADDING * 2)
         if target != self.radar_area.canvas_size:
             self.radar_area.canvas_size = target
-            self.radar_area.center = target // 2
             self.radar_area.set_size_request(target, target)
             self._center_radar_view()
 
@@ -587,19 +677,15 @@ class TravelbookApp(Gtk.Window):
 
         poi_min = max(90, int(h * (0.14 if compact else 0.17)))
         poi_max = max(poi_min + 20, int(h * (0.24 if compact else 0.30)))
-        self.poi_list_scroller.set_min_content_height(poi_min)
-        self.poi_list_scroller.set_max_content_height(poi_max)
+        self._set_scroller_height(self.poi_list_scroller, poi_min, poi_max)
 
         diary_list_min_default = max(90, int(h * 0.14))
         diary_list_max_default = max(diary_list_min_default + 20, int(h * 0.22))
-        if self.diary_entries:
-            self.diary_list_scroller.set_min_content_height(diary_list_min_default)
-            self.diary_list_scroller.set_max_content_height(diary_list_max_default)
+        self._set_scroller_height(self.diary_list_scroller, diary_list_min_default, diary_list_max_default)
 
         editor_min = max(180, int(h * 0.34))
-        self.diary_editor_scroller.set_min_content_height(editor_min)
-        self.city_poi_scroller.set_min_content_height(max(120, int(h * 0.16)))
-        self.city_poi_scroller.set_max_content_height(max(180, int(h * 0.24)))
+        self._set_scroller_height(self.diary_editor_scroller, editor_min)
+        self._set_scroller_height(self.city_poi_scroller, max(120, int(h * 0.16)), max(180, int(h * 0.24)))
 
     def _estimate_tab_bar_width(self) -> int:
         if not hasattr(self, "tab_titles"):
@@ -614,7 +700,16 @@ class TravelbookApp(Gtk.Window):
     def _update_tab_collapse(self, window_width: int):
         threshold = int(max(240, window_width * 0.8))
         estimated = self._estimate_tab_bar_width()
-        collapse = estimated > threshold
+        margin = 36
+        if self.tabs_collapsed is None:
+            collapse = estimated > threshold
+        elif self.tabs_collapsed:
+            collapse = estimated > (threshold - margin)
+        else:
+            collapse = estimated > (threshold + margin)
+        if collapse == self.tabs_collapsed:
+            return
+        self.tabs_collapsed = collapse
         self.notebook.set_show_tabs(not collapse)
         if collapse:
             self.menu_button.show()
@@ -632,6 +727,37 @@ class TravelbookApp(Gtk.Window):
         self.poi_error_label.set_markup(f"<span foreground='red'>{safe_message}</span>")
         self.poi_error_label.show()
 
+    def _set_diary_view(self, name: str):
+        if not hasattr(self, "diary_stack"):
+            return
+        self.diary_stack.set_visible_child_name(name)
+        editor_active = name == "editor"
+        if hasattr(self, "diary_editor_view_btn"):
+            self.diary_editor_view_btn.set_sensitive(not editor_active)
+        if hasattr(self, "diary_history_view_btn"):
+            self.diary_history_view_btn.set_sensitive(editor_active)
+
+    def _show_diary_editor(self):
+        self._set_diary_view("editor")
+
+    def _show_diary_history(self):
+        self._set_diary_view("history")
+
+    def _focus_diary_editor(self):
+        if not hasattr(self, "diary_textview"):
+            return
+
+        def _focus():
+            if not self.diary_textview.get_visible():
+                return False
+            try:
+                self.diary_textview.grab_focus()
+            except Exception:
+                pass
+            return False
+
+        GLib.idle_add(_focus)
+
     def _set_indicator_markup(self, label: Gtk.Label, title: str, value: str, level: str):
         color = INDICATOR_COLORS.get(level, INDICATOR_COLORS["muted"])
         safe_title = GLib.markup_escape_text(title)
@@ -647,8 +773,8 @@ class TravelbookApp(Gtk.Window):
             self.reload_requested,
         )
         self._set_indicator_markup(self.gps_indicator_label, "GPS", *indicators["GPS"])
-        self._set_indicator_markup(self.network_indicator_label, "Network", *indicators["Network"])
-        self._set_indicator_markup(self.loading_indicator_label, "Data", *indicators["Data"])
+        self._set_indicator_markup(self.network_indicator_label, "NET", *indicators["Network"])
+        self._set_indicator_markup(self.loading_indicator_label, "DATA", *indicators["Data"])
 
     def _on_category_toggled(self, widget: Gtk.CheckButton, key: object):
         keys = (key,) if isinstance(key, str) else tuple(key)
@@ -661,20 +787,28 @@ class TravelbookApp(Gtk.Window):
 
     def _tick_heading(self):
         try:
+            previous_effective_heading = self.get_effective_heading()
+            previous_compass_available = self.compass_available
             self.compass_available = self.compass_provider.is_available()
             new_heading = self.compass_provider.get_heading()
             if new_heading is None:
-                self._refresh_navigation_view()
-                self.radar_area.queue_draw()
+                if previous_effective_heading is not None or previous_compass_available != self.compass_available:
+                    self._refresh_navigation_view()
+                    self.radar_area.schedule_draw()
                 return True
 
             if self.heading_deg is None:
                 self.heading_deg = new_heading
+                heading_changed = True
             else:
                 diff = (new_heading - self.heading_deg + 540.0) % 360.0 - 180.0
                 self.heading_deg = (self.heading_deg + (0.45 * diff) + 360.0) % 360.0
-            self._refresh_navigation_view()
-            self.radar_area.queue_draw()
+                heading_changed = abs(diff) >= RADAR_HEADING_REDRAW_THRESHOLD_DEG
+            if previous_compass_available != self.compass_available:
+                heading_changed = True
+            if heading_changed:
+                self._refresh_navigation_view()
+                self.radar_area.schedule_draw()
         except Exception:
             pass
         return True
@@ -710,7 +844,7 @@ class TravelbookApp(Gtk.Window):
                         self.pois = []
                         self._update_mode_ui()
                         self._update_runtime_indicators()
-                        self.radar_area.queue_draw()
+                        self.radar_area.schedule_draw()
                         self._refresh_poi_list()
                         self._refresh_navigation_view()
                         self._update_research_view()
@@ -753,7 +887,7 @@ class TravelbookApp(Gtk.Window):
             self._refresh_pois(force=False)
             self._refresh_region_info(force=False)
             self._refresh_navigation_view()
-            self.radar_area.queue_draw()
+            self.radar_area.schedule_draw()
         except Exception:
             self.location_source = "none"
             self._set_status("Interner Fehler im Update-Timer")
@@ -887,8 +1021,9 @@ class TravelbookApp(Gtk.Window):
         self.diary_date = d
         self.diary_entries = load_diary_entries(self.diary_dir, d)
         self.diary_edit_id = None
-        if hasattr(self, "diary_entry"):
+        if hasattr(self, "diary_textview"):
             self.diary_textview.get_buffer().set_text("")
+        self._show_diary_editor()
         self._refresh_diary_list()
 
     def _save_diary_day(self):
@@ -898,13 +1033,15 @@ class TravelbookApp(Gtk.Window):
         if not hasattr(self, "diary_listbox"):
             return
         self.diary_date_label.set_text(f"Tagebuch: {self.diary_date.isoformat()}")
+        handler_id = getattr(self, "diary_listbox_row_selected_handler", None)
+        if handler_id is not None:
+            self.diary_listbox.handler_block(handler_id)
+        self.diary_listbox.unselect_all()
 
         for child in self.diary_listbox.get_children():
             self.diary_listbox.remove(child)
 
         if not self.diary_entries:
-            self.diary_list_scroller.set_min_content_height(56)
-            self.diary_list_scroller.set_max_content_height(90)
             row = Gtk.ListBoxRow()
             label = Gtk.Label()
             label.set_markup("<span size='small' alpha='70%'>Keine Einträge für diesen Tag</span>")
@@ -914,10 +1051,9 @@ class TravelbookApp(Gtk.Window):
             row.add(label)
             self.diary_listbox.add(row)
             self.diary_listbox.show_all()
+            if handler_id is not None:
+                self.diary_listbox.handler_unblock(handler_id)
             return
-        self.diary_list_scroller.set_min_content_height(120)
-        self.diary_list_scroller.set_max_content_height(220)
-
         for entry in self.diary_entries:
             row = Gtk.ListBoxRow()
             row.entry_id = entry.get("id")
@@ -941,6 +1077,16 @@ class TravelbookApp(Gtk.Window):
                 if footer_text:
                     footer_text += " | "
                 footer_text += f"POI: {meta_poi.get('name', '-')}"
+            ai_status = entry.get("ai_status")
+            if isinstance(ai_status, str) and ai_status:
+                if footer_text:
+                    footer_text += " | "
+                ai_labels = {
+                    "queued": "KI: Warteschlange",
+                    "done": "KI: überarbeitet",
+                    "error": "KI: Fehler",
+                }
+                footer_text += ai_labels.get(ai_status, f"KI: {ai_status}")
             if footer_text:
                 footer = Gtk.Label(label=footer_text)
                 footer.set_xalign(0.0)
@@ -953,6 +1099,8 @@ class TravelbookApp(Gtk.Window):
             self.diary_listbox.add(row)
 
         self.diary_listbox.show_all()
+        if handler_id is not None:
+            self.diary_listbox.handler_unblock(handler_id)
 
     def _on_diary_row_selected(self, _listbox: Gtk.ListBox, row: Optional[Gtk.ListBoxRow]):
         if row is None:
@@ -964,7 +1112,8 @@ class TravelbookApp(Gtk.Window):
             if entry.get("id") == entry_id:
                 self.diary_edit_id = entry_id
                 self.diary_textview.get_buffer().set_text(entry.get("text", ""))
-                self.diary_textview.grab_focus()
+                self._show_diary_editor()
+                self._focus_diary_editor()
                 break
 
     def _on_diary_prev_day(self, *_):
@@ -979,7 +1128,18 @@ class TravelbookApp(Gtk.Window):
     def _on_diary_clear_edit(self, *_):
         self.diary_edit_id = None
         self.diary_textview.get_buffer().set_text("")
-        self.diary_textview.grab_focus()
+        self._show_diary_editor()
+        self._focus_diary_editor()
+
+    def _set_diary_busy(self, busy: bool):
+        if hasattr(self, "diary_save_btn"):
+            self.diary_save_btn.set_label("..." if busy else "Speichern")
+            self.diary_save_btn.set_sensitive(not busy)
+        if hasattr(self, "diary_clear_btn"):
+            self.diary_clear_btn.set_sensitive(not busy)
+        if hasattr(self, "diary_textview"):
+            self.diary_textview.set_editable(not busy)
+            self.diary_textview.set_cursor_visible(not busy)
 
     def _on_diary_save_entry(self, *_):
         buf = self.diary_textview.get_buffer()
@@ -1000,35 +1160,136 @@ class TravelbookApp(Gtk.Window):
                 "distance_m": int(self.selected_poi.distance_m),
             }
 
-        if self.diary_edit_id is not None:
-            updated = False
-            for entry in self.diary_entries:
-                if entry.get("id") == self.diary_edit_id:
-                    entry["text"] = text
-                    entry["updated_at"] = now
-                    entry["location"] = location_meta
-                    entry["selected_poi"] = poi_meta
-                    updated = True
-                    break
-            if not updated:
-                self.diary_edit_id = None
-
-        if self.diary_edit_id is None:
+        entry_id = self.diary_edit_id or str(uuid.uuid4())
+        updated = False
+        for entry in self.diary_entries:
+            if entry.get("id") == entry_id:
+                entry["text"] = text
+                entry["updated_at"] = now
+                entry["location"] = location_meta
+                entry["selected_poi"] = poi_meta
+                entry["ai_status"] = "queued"
+                updated = True
+                break
+        if not updated:
             self.diary_entries.append(
                 {
-                    "id": str(uuid.uuid4()),
+                    "id": entry_id,
                     "created_at": now,
                     "updated_at": now,
                     "text": text,
                     "location": location_meta,
                     "selected_poi": poi_meta,
+                    "ai_status": "queued",
                 }
             )
         self._save_diary_day()
         self._refresh_diary_list()
         self.diary_edit_id = None
         self.diary_textview.get_buffer().set_text("")
-        self._set_status(f"Tagebuch gespeichert: {self.diary_date.isoformat()}")
+        self._show_diary_editor()
+        self._set_status("Tagebuch gespeichert, Ollama überarbeitet den Eintrag im Hintergrund")
+        thread = threading.Thread(
+            target=self._diary_save_thread,
+            args=(self.diary_date, entry_id, text, now, location_meta, poi_meta),
+            daemon=True,
+        )
+        thread.start()
+
+    def _on_ollama_settings_save(self, *_):
+        prompt_buffer = self.ollama_prompt_view.get_buffer()
+        prompt = prompt_buffer.get_text(prompt_buffer.get_start_iter(), prompt_buffer.get_end_iter(), True).strip()
+        base_url = self.ollama_base_url_entry.get_text().strip() or OLLAMA_BASE_URL_DEFAULT
+        self.ollama_base_url = base_url
+        self.ollama_diary_system_prompt = prompt or OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT
+        self.app_settings = {
+            "ollama_base_url": self.ollama_base_url,
+            "ollama_diary_system_prompt": self.ollama_diary_system_prompt,
+        }
+        save_app_settings(self.app_data_dir, self.app_settings)
+        self._set_status("Ollama-Einstellungen gespeichert")
+
+    def _diary_save_thread(
+        self,
+        day: date,
+        entry_id: str,
+        text: str,
+        updated_at: str,
+        location_meta: Optional[Dict[str, float]],
+        poi_meta: Optional[Dict[str, object]],
+    ):
+        last_error = "Ollama konnte den Eintrag nicht überarbeiten."
+        for _attempt in range(3):
+            try:
+                improved = improve_diary_entry(
+                    text,
+                    base_url=self.ollama_base_url,
+                    system_prompt=self.ollama_diary_system_prompt,
+                )
+                GLib.idle_add(self._apply_diary_save_result, day, entry_id, updated_at, improved, location_meta, poi_meta)
+                return
+            except DiaryImproveError as exc:
+                last_error = exc.user_message
+            except Exception:
+                last_error = "Ollama konnte den Eintrag nicht überarbeiten."
+        GLib.idle_add(self._apply_diary_save_failure, day, entry_id, last_error)
+
+    def _apply_diary_save_result(
+        self,
+        day: date,
+        entry_id: str,
+        updated_at: str,
+        improved_text: str,
+        location_meta: Optional[Dict[str, float]],
+        poi_meta: Optional[Dict[str, object]],
+    ):
+        entries = self.diary_entries if self.diary_date == day else load_diary_entries(self.diary_dir, day)
+        updated = False
+        for entry in entries:
+            if entry.get("id") == entry_id:
+                entry["text"] = improved_text
+                entry["updated_at"] = updated_at
+                entry["location"] = location_meta
+                entry["selected_poi"] = poi_meta
+                entry["ai_status"] = "done"
+                updated = True
+                break
+        if not updated:
+            entries.append(
+                {
+                    "id": entry_id,
+                    "created_at": updated_at,
+                    "updated_at": updated_at,
+                    "text": improved_text,
+                    "location": location_meta,
+                    "selected_poi": poi_meta,
+                    "ai_status": "done",
+                }
+            )
+
+        if self.diary_date == day:
+            self.diary_entries = entries
+            self._save_diary_day()
+            self._refresh_diary_list()
+            self._set_status("Tagebuch-Eintrag durch Ollama überarbeitet")
+        else:
+            save_diary_entries(self.diary_dir, day, entries, version=DIARY_APP_VERSION)
+        return False
+
+    def _apply_diary_save_failure(self, day: date, entry_id: str, message: str):
+        entries = self.diary_entries if self.diary_date == day else load_diary_entries(self.diary_dir, day)
+        for entry in entries:
+            if entry.get("id") == entry_id:
+                entry["ai_status"] = "error"
+                break
+        if self.diary_date == day:
+            self.diary_entries = entries
+            self._save_diary_day()
+            self._refresh_diary_list()
+        else:
+            save_diary_entries(self.diary_dir, day, entries, version=DIARY_APP_VERSION)
+        self._set_status(message)
+        return False
 
     def _get_manual_location(self) -> Optional[Tuple[float, float]]:
         try:
@@ -1040,7 +1301,7 @@ class TravelbookApp(Gtk.Window):
 
     def _refresh_pois(self, force: bool):
         if self.current_location is None:
-            self.radar_area.queue_draw()
+            self.radar_area.schedule_draw()
             return
         now = time.time()
         seconds_since_refresh = None if self.last_poi_query_ts is None else now - self.last_poi_query_ts
@@ -1056,7 +1317,7 @@ class TravelbookApp(Gtk.Window):
             ):
                 self.reload_requested = True
             self._update_runtime_indicators()
-            self.radar_area.queue_draw()
+            self.radar_area.schedule_draw()
             return
 
         if not force and not should_refresh_pois(
@@ -1067,8 +1328,8 @@ class TravelbookApp(Gtk.Window):
             seconds_since_refresh,
             self._distance_m,
         ):
-                self.radar_area.queue_draw()
-                return
+            self.radar_area.schedule_draw()
+            return
 
         self.fetch_in_progress = True
         self.active_poi_query_location = self.current_location
@@ -1139,7 +1400,7 @@ class TravelbookApp(Gtk.Window):
         self._set_poi_error("")
         self._update_mode_ui()
         self._update_runtime_indicators()
-        self.radar_area.queue_draw()
+        self.radar_area.schedule_draw()
         self._refresh_poi_list()
         self._refresh_navigation_view()
         if self.current_location is not None and should_refresh_pois(
@@ -1278,7 +1539,7 @@ class TravelbookApp(Gtk.Window):
                 self.nav_link_button.hide()
             if not is_city_poi(poi):
                 self._clear_city_poi_table("Stadt-POIs: nur verfuegbar, wenn das Ziel eine Stadt ist.")
-        self.navigation_area.queue_draw()
+        self.navigation_area.schedule_draw()
 
     @staticmethod
     def _infer_category(tags: Dict[str, str]) -> str:

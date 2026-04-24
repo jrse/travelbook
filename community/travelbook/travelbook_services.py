@@ -21,6 +21,12 @@ from travelbook_core import (
     DRIVE_MODE_MIN_AVG_SPEED_MPS,
     GPS_SPEED_MIN_MOVE_M,
     MAX_VISIBLE_POI_RESULTS,
+    OLLAMA_BASE_URL_DEFAULT,
+    OLLAMA_CONNECT_TIMEOUT_SECS,
+    OLLAMA_DIARY_MAX_TOKENS,
+    OLLAMA_DIARY_MODEL,
+    OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
+    OLLAMA_READ_TIMEOUT_SECS,
     POI_FETCH_BACKOFF_SECS,
     POI_FETCH_RETRYABLE_STATUS_CODES,
     POI_FETCH_RETRY_COUNT,
@@ -49,6 +55,12 @@ class PoiFetchError(RuntimeError):
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class DiaryImproveError(RuntimeError):
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
 OVERPASS_FILTER_BATCH_SIZE = 24
@@ -189,6 +201,124 @@ def resolve_region(lat: float, lon: float, http_get=requests.get) -> Dict[str, s
 
 def diary_file_path(base_dir: Path, day: date) -> Path:
     return base_dir / f"{day.isoformat()}.json"
+
+
+def settings_file_path(base_dir: Path) -> Path:
+    return base_dir / "settings.json"
+
+
+def load_app_settings(base_dir: Path) -> Dict[str, str]:
+    defaults = {
+        "ollama_base_url": OLLAMA_BASE_URL_DEFAULT,
+        "ollama_diary_system_prompt": OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
+    }
+    path = settings_file_path(base_dir)
+    if not path.exists():
+        return defaults.copy()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return defaults.copy()
+    if not isinstance(payload, dict):
+        return defaults.copy()
+    settings = defaults.copy()
+    for key in defaults:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            settings[key] = value.strip()
+    return settings
+
+
+def save_app_settings(base_dir: Path, settings: Dict[str, str]) -> None:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ollama_base_url": str(settings.get("ollama_base_url", OLLAMA_BASE_URL_DEFAULT)).strip(),
+        "ollama_diary_system_prompt": str(
+            settings.get("ollama_diary_system_prompt", OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT)
+        ).strip(),
+    }
+    settings_file_path(base_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ollama_generate_url(base_url: str) -> str:
+    normalized = (base_url or OLLAMA_BASE_URL_DEFAULT).strip().rstrip("/")
+    if normalized.endswith("/api"):
+        return f"{normalized}/generate"
+    return f"{normalized}/api/generate"
+
+
+def improve_diary_entry(
+    text: str,
+    *,
+    base_url: str,
+    system_prompt: str,
+    model: str = OLLAMA_DIARY_MODEL,
+    http_post=requests.post,
+) -> str:
+    prompt = text.strip()
+    if not prompt:
+        raise DiaryImproveError("Tagebuchtext ist leer.")
+
+    request_url = ollama_generate_url(base_url)
+    request_payload = {
+        "model": model,
+        "prompt": prompt,
+        "system": system_prompt.strip() or OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
+        "stream": True,
+        "think": False,
+        "options": {"num_predict": OLLAMA_DIARY_MAX_TOKENS},
+    }
+    LOGGER.warning("Ollama diary request url=%s payload=%s", request_url, json.dumps(request_payload, ensure_ascii=False))
+
+    response = None
+    try:
+        response = http_post(
+            request_url,
+            json=request_payload,
+            headers={
+                "Accept": "application/x-ndjson,application/json;q=0.9,*/*;q=0.8",
+                "User-Agent": f"{APP_ID}/diary-improve",
+            },
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, OLLAMA_READ_TIMEOUT_SECS),
+            stream=True,
+        )
+        response.raise_for_status()
+        parts: List[str] = []
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            try:
+                chunk = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise DiaryImproveError("Ollama lieferte ungültige Streaming-Daten.") from exc
+            if not isinstance(chunk, dict):
+                continue
+            response_part = chunk.get("response")
+            if isinstance(response_part, str) and response_part:
+                parts.append(response_part)
+            if chunk.get("done") is True:
+                break
+        improved = "".join(parts).strip()
+        if not improved:
+            raise DiaryImproveError("Ollama lieferte keinen überarbeiteten Tagebucheintrag.")
+        LOGGER.warning("Ollama diary result=%s", improved)
+        return improved
+    except requests.Timeout as exc:
+        raise DiaryImproveError("Ollama hat nicht rechtzeitig geantwortet.") from exc
+    except requests.ConnectionError as exc:
+        raise DiaryImproveError("Keine Verbindung zum Ollama-Dienst.") from exc
+    except requests.HTTPError as exc:
+        raise DiaryImproveError(
+            f"Ollama hat die Anfrage abgelehnt (HTTP {getattr(getattr(exc, 'response', None), 'status_code', '?')})."
+        ) from exc
+    except requests.RequestException as exc:
+        raise DiaryImproveError("Ollama-Anfrage ist fehlgeschlagen.") from exc
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def load_diary_entries(base_dir: Path, day: date) -> List[Dict]:

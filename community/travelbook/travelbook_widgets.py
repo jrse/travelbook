@@ -11,7 +11,9 @@ from travelbook_core import (
     APP_ID,
     MIN_CANVAS_SIZE,
     Poi,
+    RADAR_LABEL_LIMIT,
     RADAR_TILE_FETCH_TIMEOUT_SECS,
+    RADAR_TILE_REQUESTS_PER_DRAW,
     RADAR_TILE_OPACITY,
     RADAR_TILE_SIZE,
     RADAR_TILE_URL_TEMPLATE,
@@ -28,6 +30,14 @@ gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo, cairo  # noqa: E402
 
 
+def _layout_cache_key(widget: Gtk.DrawingArea, text: str, size: float) -> Tuple[str, int, str]:
+    settings = Gtk.Settings.get_default()
+    font_name = ""
+    if settings is not None:
+        font_name = str(settings.get_property("gtk-font-name") or "")
+    return text, int(size * Pango.SCALE), font_name
+
+
 def _draw_text(
     widget: Gtk.DrawingArea,
     cr: cairo.Context,
@@ -37,15 +47,21 @@ def _draw_text(
     *,
     size: float,
 ) -> None:
-    layout = widget.create_pango_layout(text)
-    description = Pango.FontDescription()
-    settings = Gtk.Settings.get_default()
-    if settings is not None:
-        font_name = settings.get_property("gtk-font-name")
-        if font_name:
-            description = Pango.FontDescription(font_name)
-    description.set_absolute_size(int(size * Pango.SCALE))
-    layout.set_font_description(description)
+    cache = getattr(widget, "_text_layout_cache", None)
+    cache_key = _layout_cache_key(widget, text, size)
+    layout = cache.get(cache_key) if cache is not None else None
+    if layout is None:
+        layout = widget.create_pango_layout(text)
+        description = Pango.FontDescription()
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            font_name = settings.get_property("gtk-font-name")
+            if font_name:
+                description = Pango.FontDescription(font_name)
+        description.set_absolute_size(int(size * Pango.SCALE))
+        layout.set_font_description(description)
+        if cache is not None:
+            cache[cache_key] = layout
     cr.move_to(x, y)
     PangoCairo.show_layout(cr, layout)
 
@@ -61,6 +77,8 @@ class RadarArea(Gtk.DrawingArea):
         self._tile_cache: Dict[Tuple[int, int, int], GdkPixbuf.Pixbuf] = {}
         self._pending_tiles: Set[Tuple[int, int, int]] = set()
         self._failed_tiles: Set[Tuple[int, int, int]] = set()
+        self._text_layout_cache: Dict[Tuple[str, int, str], Pango.Layout] = {}
+        self._draw_queued = False
 
         self.set_size_request(self.canvas_size, self.canvas_size)
         self.set_can_focus(True)
@@ -112,6 +130,18 @@ class RadarArea(Gtk.DrawingArea):
 
         return False
 
+    def schedule_draw(self) -> None:
+        if self._draw_queued:
+            return
+        self._draw_queued = True
+
+        def _flush():
+            self._draw_queued = False
+            self.queue_draw()
+            return False
+
+        GLib.idle_add(_flush)
+
     def _visible_radius_to_zoom(self, lat: float, max_r: float, visible_radius_m: float) -> int:
         if visible_radius_m <= 0 or max_r <= 0:
             return RADAR_TILE_ZOOM_MIN
@@ -155,7 +185,7 @@ class RadarArea(Gtk.DrawingArea):
 
         if pixbuf is not None:
             self._tile_cache[key] = pixbuf
-            GLib.idle_add(self.queue_draw)
+            self.schedule_draw()
 
     def _draw_map_background(
         self,
@@ -190,13 +220,16 @@ class RadarArea(Gtk.DrawingArea):
         cr.clip()
         cr.translate(center, center)
         cr.rotate(math.radians(-radar_heading))
+        requests_started = 0
 
         for tile_x in range(tile_x_min, tile_x_max + 1):
             for tile_y in range(tile_y_min, tile_y_max + 1):
                 key = (zoom, tile_x, tile_y)
                 pixbuf = self._tile_cache.get(key)
                 if pixbuf is None:
-                    self._request_tile(key)
+                    if requests_started < RADAR_TILE_REQUESTS_PER_DRAW:
+                        self._request_tile(key)
+                        requests_started += 1
                     continue
                 tile_world_x = tile_x * RADAR_TILE_SIZE
                 tile_world_y = tile_y * RADAR_TILE_SIZE
@@ -277,6 +310,7 @@ class RadarArea(Gtk.DrawingArea):
             cr.set_line_width(2)
             cr.stroke()
 
+        visible_label_count = 0
         for poi in self.app.pois:
             dist_px = poi.distance_m * scale
             if dist_px > max_r:
@@ -296,8 +330,10 @@ class RadarArea(Gtk.DrawingArea):
                 cr.stroke()
 
             cr.set_source_rgb(1, 1, 1)
-            label = poi.name[:20]
-            _draw_text(self, cr, label, x + 8, y - 14, size=12)
+            if visible_label_count < RADAR_LABEL_LIMIT:
+                label = poi.name[:20]
+                _draw_text(self, cr, label, x + 8, y - 14, size=12)
+                visible_label_count += 1
             self._projected_points.append((poi, x, y))
 
 
@@ -305,7 +341,21 @@ class NavigationArea(Gtk.DrawingArea):
     def __init__(self, app: "TravelbookApp") -> None:
         super().__init__()
         self.app = app
+        self._text_layout_cache: Dict[Tuple[str, int, str], Pango.Layout] = {}
+        self._draw_queued = False
         self.connect("draw", self.on_draw)
+
+    def schedule_draw(self) -> None:
+        if self._draw_queued:
+            return
+        self._draw_queued = True
+
+        def _flush():
+            self._draw_queued = False
+            self.queue_draw()
+            return False
+
+        GLib.idle_add(_flush)
 
     def on_draw(self, _widget, cr: cairo.Context):
         allocation = self.get_allocation()

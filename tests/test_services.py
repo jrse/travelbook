@@ -6,6 +6,7 @@ from pathlib import Path
 
 from travelbook_core import Poi, compute_runtime_indicators, format_fix_age
 from travelbook_services import (
+    DiaryImproveError,
     PoiFetchError,
     average_speed_mps,
     assign_clusters,
@@ -16,11 +17,15 @@ from travelbook_services import (
     effective_query_radius,
     extract_poi_url,
     fetch_pois,
+    improve_diary_entry,
     is_city_poi,
     load_diary_entries,
+    load_app_settings,
+    ollama_generate_url,
     poi_refresh_distance,
     poi_refresh_interval,
     resolve_region,
+    save_app_settings,
     save_diary_entries,
     should_refresh_pois,
     trim_location_samples,
@@ -31,12 +36,19 @@ class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
         self.text = ""
+        self.status_code = 200
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self.payload
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(())
+
+    def close(self):
+        return None
 
 
 def extract_query(data):
@@ -109,6 +121,70 @@ class TestServices(unittest.TestCase):
             loaded = load_diary_entries(base_dir, day)
 
             self.assertEqual(entries, loaded)
+
+    def test_app_settings_roundtrip_persists_ollama_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            save_app_settings(
+                base_dir,
+                {
+                    "ollama_base_url": "http://192.168.178.48",
+                    "ollama_diary_system_prompt": "rewrite diary entries",
+                },
+            )
+
+            loaded = load_app_settings(base_dir)
+
+            self.assertEqual("http://192.168.178.48", loaded["ollama_base_url"])
+            self.assertEqual("rewrite diary entries", loaded["ollama_diary_system_prompt"])
+
+    def test_ollama_generate_url_accepts_plain_and_api_base_urls(self):
+        self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48"))
+        self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48/api"))
+
+    def test_improve_diary_entry_accumulates_streamed_response(self):
+        calls = {}
+
+        class FakeStreamResponse(FakeResponse):
+            def iter_lines(self, decode_unicode=False):
+                lines = [
+                    '{"response":"Heute bin ich","done":false}',
+                    '{"response":" durch die Stadt gelaufen.","done":false}',
+                    '{"done":true}',
+                ]
+                return iter(lines)
+
+        def fake_post(url, json=None, **kwargs):
+            calls["url"] = url
+            calls["json"] = json
+            calls["kwargs"] = kwargs
+            return FakeStreamResponse({})
+
+        improved = improve_diary_entry(
+            "today i walked through the city",
+            base_url="http://192.168.178.48",
+            system_prompt="fix diary entry",
+            http_post=fake_post,
+        )
+
+        self.assertEqual("Heute bin ich durch die Stadt gelaufen.", improved)
+        self.assertEqual("http://192.168.178.48/api/generate", calls["url"])
+        self.assertEqual(False, calls["json"]["think"])
+        self.assertEqual(True, calls["json"]["stream"])
+        self.assertEqual(240, calls["json"]["options"]["num_predict"])
+
+    def test_improve_diary_entry_raises_on_empty_stream_response(self):
+        class EmptyStreamResponse(FakeResponse):
+            def iter_lines(self, decode_unicode=False):
+                return iter(['{"done":true}'])
+
+        with self.assertRaises(DiaryImproveError):
+            improve_diary_entry(
+                "today",
+                base_url="http://192.168.178.48",
+                system_prompt="fix diary entry",
+                http_post=lambda *_args, **_kwargs: EmptyStreamResponse({}),
+            )
 
     def test_fetch_pois_retries_timeout_then_succeeds(self):
         import requests

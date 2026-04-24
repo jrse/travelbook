@@ -8,7 +8,7 @@ arch="all"
 license="MIT"
 depends="python3 py3-requests py3-gobject3 py3-pydbus gtk+3.0 geoclue iio-sensor-proxy font-dejavu"
 makedepends=""
-source="travelbook.py travelbook_core.py travelbook_providers.py travelbook_services.py travelbook_widgets.py travelbook.desktop travelbook.svg"
+source="travelbook.py travelbook_core.py travelbook_providers.py travelbook_services.py travelbook_widgets.py travelbook.desktop travelbook.svg mode-pedestrian.svg mode-drive.svg"
 builddir="$srcdir"
 options="!check"
 
@@ -22,15 +22,19 @@ package() {
 	install -Dm644 "$srcdir"/travelbook_providers.py "$pkgdir"/usr/bin/travelbook_providers.py
 	install -Dm644 "$srcdir"/travelbook_services.py "$pkgdir"/usr/bin/travelbook_services.py
 	install -Dm644 "$srcdir"/travelbook_widgets.py "$pkgdir"/usr/bin/travelbook_widgets.py
+	install -Dm644 "$srcdir"/mode-pedestrian.svg "$pkgdir"/usr/bin/mode-pedestrian.svg
+	install -Dm644 "$srcdir"/mode-drive.svg "$pkgdir"/usr/bin/mode-drive.svg
 	install -Dm644 "$srcdir"/travelbook.desktop "$pkgdir"/usr/share/applications/travelbook.desktop
 	install -Dm644 "$srcdir"/travelbook.svg "$pkgdir"/usr/share/icons/hicolor/scalable/apps/travelbook.svg
 }
 sha512sums="
-cd71ffb293a237a9ac14e03fe31ca107f14495f7c88f0e587dba7ec8007415953235fb0bcd27f046d3890c410848c3f0a4047ff3a465d4ccd89238ed88f5382f  travelbook.py
-805ca9ea5f3ec36782f1023e1f559c762ae4172c1c35b2477a192e89434734c90005638a69a90ae1fdf55709e52adb7e9fac172c17a119b327201cc9c4cfb4e7  travelbook_core.py
+9be71f569407d176687ae717f57c95fc489d950698d57673a9039900624468f72aacdc38ce5c4a4841dadd7c643118d3f4ee31e8426a90c3ff1148076e07bc6d  travelbook.py
+8ff7c802011ee65577d430e625ea41fd2a1be51c7dd9fb008be383eb8d7d2f3c501d609be90663a1ea6b02044356bf9b4bd8765ea076198f397dc1ec36c4dcb4  travelbook_core.py
 52385c99fc4672b7f5094718bb93e1902d3ea7be313ee2bc29a63acd92c80f00c004e3d8b3735dcd211a0205a9f90957757821b8834c228fc498149e3c92b3ba  travelbook_providers.py
-04a20458c3f4ba952e122d07e76bc13466bbbd7aaa726f20f77e6a56705f902385df67eb3780363d287334b42461c399112f4f811d93da1e39d17435f0a607f6  travelbook_services.py
-c457934ab390d4735f0bf4a03bf1a7f497965c801e258f6ebf0f31194d2be45da645ad47c3c42e68f09aba35e120776098bea8a12a27154e684945403fbd5ad9  travelbook_widgets.py
+dbbd8ae4d528c4fe5a545ee6425a35d0a9c7d4f07ee935318c2ffd08e9da66b29b6c325f25e163a2c821e5c33ec5948c29aa9e3227f8c194eaf1dd69a8c7a9e1  travelbook_services.py
+cb1f5866354da7f32c250dfa26ba811cac8bf59baae11e6727577fecb9da7109fc83ac781e679d227bb67328117fe84f9f2b465b3e1666363c0c8cd2dd9543ff  travelbook_widgets.py
 1b17b2b9414d5be5b81e77e83ca998257a2798f483a73855e0ffe691893b61ca33400d4486e7a790483989af8932f6f90a9f10ab78e7e9c783854acb8d2f7a9b  travelbook.desktop
 2b6a93c665fd62f87e639ecc9913fa65a1b7af212f9e7ff900b1411035dbe8b540111db623a684049b5ddd46f05e1909ec5c8a17a4e6085c567fba2842927ca1  travelbook.svg
+33aad012ee93efca0ac44d51ee9c8d43e652657db12aae24ba2a006606940cb625893668587d6610985322f3784de1a218900e94952e655ccc699817d523a77b  mode-pedestrian.svg
+b8387411cfc5457bb83e63e19fb27b3e60eecbc8a990b38a6e3c27028a719f7f75adbc275f538becb98e5311f704db8db612f5b1c25a3660846fcf06886d1329  mode-drive.svg
 "

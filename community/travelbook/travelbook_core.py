@@ -20,6 +20,18 @@ RADAR_TILE_ZOOM_MIN = 12
 RADAR_TILE_ZOOM_MAX = 17
 RADAR_TILE_FETCH_TIMEOUT_SECS = 8
 RADAR_TILE_URL_TEMPLATE = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+RADAR_TILE_REQUESTS_PER_DRAW = 2
+RADAR_LABEL_LIMIT = 24
+RADAR_HEADING_REDRAW_THRESHOLD_DEG = 1.5
+OLLAMA_BASE_URL_DEFAULT = "http://192.168.178.48:11434"
+OLLAMA_DIARY_MODEL = "qwen3:8b"
+OLLAMA_DIARY_MAX_TOKENS = 240
+OLLAMA_CONNECT_TIMEOUT_SECS = 5
+OLLAMA_READ_TIMEOUT_SECS = 90
+OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT = (
+    "Correct spelling and grammar, rewrite as a concise first-person diary entry, "
+    "return only the diary text, and keep it under 240 tokens."
+)
 EXTRA_AMENITY_VALUES = [
     "bar",
     "biergarten",
