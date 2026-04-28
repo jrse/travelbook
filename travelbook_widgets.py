@@ -1,5 +1,7 @@
+import logging
 import math
 import threading
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import gi
@@ -13,6 +15,7 @@ from travelbook_core import (
     Poi,
     RADAR_LABEL_LIMIT,
     RADAR_TILE_FETCH_TIMEOUT_SECS,
+    RADAR_TILE_OPACITY_DRIVE,
     RADAR_TILE_REQUESTS_PER_DRAW,
     RADAR_TILE_OPACITY,
     RADAR_TILE_SIZE,
@@ -28,6 +31,9 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo, cairo  # noqa: E402
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _layout_cache_key(widget: Gtk.DrawingArea, text: str, size: float) -> Tuple[str, int, str]:
@@ -70,8 +76,6 @@ class RadarArea(Gtk.DrawingArea):
     def __init__(self, app: "TravelbookApp") -> None:
         super().__init__()
         self.app = app
-        self.canvas_size = MIN_CANVAS_SIZE
-        self.center = self.canvas_size // 2
         self._pinch_base_zoom = 1.0
         self._projected_points: List[Tuple[Poi, float, float]] = []
         self._tile_cache: Dict[Tuple[int, int, int], GdkPixbuf.Pixbuf] = {}
@@ -79,8 +83,9 @@ class RadarArea(Gtk.DrawingArea):
         self._failed_tiles: Set[Tuple[int, int, int]] = set()
         self._text_layout_cache: Dict[Tuple[str, int, str], Pango.Layout] = {}
         self._draw_queued = False
+        self._last_metrics_trace_ts = 0.0
 
-        self.set_size_request(self.canvas_size, self.canvas_size)
+        self.set_size_request(MIN_CANVAS_SIZE, MIN_CANVAS_SIZE)
         self.set_can_focus(True)
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
         self.connect("draw", self.on_draw)
@@ -95,11 +100,45 @@ class RadarArea(Gtk.DrawingArea):
             self.zoom_gesture = None
 
     def _metrics(self) -> Tuple[float, float, float, float]:
-        center = float(self.center)
-        max_r = float(max(200, min(self.center - 50, 900)))
+        allocation = self.get_allocation()
+        requested_width, requested_height = self.get_size_request()
+        content_width = float(allocation.width if allocation.width > 0 else requested_width if requested_width > 0 else MIN_CANVAS_SIZE)
+        content_height = float(
+            allocation.height if allocation.height > 0 else requested_height if requested_height > 0 else MIN_CANVAS_SIZE
+        )
+        center = min(content_width, content_height) / 2.0
+        max_r = float(max(200, min(center - 50, 900)))
         radius_m = float(self.app.get_effective_query_radius())
         scale = (max_r / radius_m) * self.app.zoom_factor
+        self._trace_metrics(
+            content_width=content_width,
+            content_height=content_height,
+            center=center,
+            max_r=max_r,
+            radius_m=radius_m,
+            scale=scale,
+        )
         return center, max_r, scale, radius_m / self.app.zoom_factor
+
+    def _trace_metrics(self, *, content_width: float, content_height: float, center: float, max_r: float, radius_m: float, scale: float):
+        now = time.time()
+        if (now - self._last_metrics_trace_ts) < 0.5:
+            return
+        self._last_metrics_trace_ts = now
+        allocation = self.get_allocation()
+        LOGGER.info(
+            "radar metrics request=(%s,%s) allocation=(%s,%s) content=(%.1f,%.1f) center=%.1f max_r=%.1f radius_m=%.1f scale=%.4f zoom=%.2f",
+            *self.get_size_request(),
+            allocation.width,
+            allocation.height,
+            content_width,
+            content_height,
+            center,
+            max_r,
+            radius_m,
+            scale,
+            self.app.zoom_factor,
+        )
 
     def on_zoom_begin(self, _gesture, _sequence):
         self._pinch_base_zoom = self.app.zoom_factor
@@ -239,7 +278,8 @@ class RadarArea(Gtk.DrawingArea):
                 cr.translate(draw_x, draw_y)
                 cr.scale(scale, scale)
                 Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
-                cr.paint_with_alpha(RADAR_TILE_OPACITY)
+                tile_opacity = RADAR_TILE_OPACITY_DRIVE if self.app.travel_mode == "drive" else RADAR_TILE_OPACITY
+                cr.paint_with_alpha(tile_opacity)
                 cr.restore()
 
         cr.restore()
@@ -248,13 +288,19 @@ class RadarArea(Gtk.DrawingArea):
         center, max_r, scale, visible_radius_m = self._metrics()
         radar_heading = self.app.get_effective_heading() or 0.0
 
-        cr.set_source_rgb(0.04, 0.08, 0.10)
+        if self.app.travel_mode == "drive":
+            cr.set_source_rgb(0.07, 0.11, 0.13)
+        else:
+            cr.set_source_rgb(0.04, 0.08, 0.10)
         cr.paint()
 
         self._draw_map_background(cr, center, max_r, visible_radius_m, radar_heading)
 
         cr.set_line_width(1)
-        cr.set_source_rgb(0.15, 0.45, 0.35)
+        if self.app.travel_mode == "drive":
+            cr.set_source_rgb(0.28, 0.66, 0.52)
+        else:
+            cr.set_source_rgb(0.15, 0.45, 0.35)
         ring_ratios = [0.25, 0.5, 0.75, 1.0]
         for ratio in ring_ratios:
             cr.arc(center, center, max_r * ratio, 0, 2 * math.pi)
@@ -266,7 +312,10 @@ class RadarArea(Gtk.DrawingArea):
         cr.line_to(center, center + max_r)
         cr.stroke()
 
-        cr.set_source_rgb(0.60, 0.85, 0.72)
+        if self.app.travel_mode == "drive":
+            cr.set_source_rgb(0.78, 0.96, 0.84)
+        else:
+            cr.set_source_rgb(0.60, 0.85, 0.72)
         for ratio in ring_ratios:
             dist = int(visible_radius_m * ratio)
             _draw_text(self, cr, f"{dist} m", center + 6, center - (max_r * ratio) - 12, size=12)

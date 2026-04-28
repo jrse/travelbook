@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import logging
 import math
+import subprocess
 import threading
 import uuid
 import time
@@ -71,7 +73,11 @@ from travelbook_widgets import NavigationArea, RadarArea
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, cairo  # noqa: E402
+gi.require_version("Gio", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, cairo  # noqa: E402
+
+
+LOGGER = logging.getLogger(__name__)
 
 WEBKIT_AVAILABLE = False
 WebKit2 = None
@@ -90,6 +96,7 @@ for _webkit_ver in ("4.1", "4.0"):
 class TravelbookApp(Gtk.Window):
     def __init__(self) -> None:
         super().__init__(title="travelbook")
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         self.screen_width, self.screen_height = self._detect_screen_resolution()
         self.set_default_size(self.screen_width, self.screen_height)
         self.connect("destroy", self._on_destroy)
@@ -105,6 +112,13 @@ class TravelbookApp(Gtk.Window):
         self.current_speed_mps: Optional[float] = None
         self.avg_speed_mps: Optional[float] = None
         self.travel_mode = "pedestrian"
+        self.manual_travel_mode: Optional[str] = None
+        self.screen_inhibit_cookie: Optional[int] = None
+        self.screen_inhibit_method: Optional[str] = None
+        self.drive_brightness_applied = False
+        self.saved_brightness_path: Optional[Path] = None
+        self.saved_brightness_value: Optional[int] = None
+        self._last_radar_viewport_trace_ts = 0.0
         self.location_samples: List[Tuple[float, Tuple[float, float]]] = []
         self.last_real_gps_location: Optional[Tuple[float, float]] = None
         self.last_real_gps_fix_ts: Optional[float] = None
@@ -132,6 +146,8 @@ class TravelbookApp(Gtk.Window):
         self.diary_entries: List[Dict] = []
         self.diary_edit_id: Optional[str] = None
         self.tabs_collapsed: Optional[bool] = None
+        self._programmatic_radar_scroll = False
+        self._radar_user_has_panned = False
         self.radar_page_idx = -1
         self.profile_page_idx = -1
         self.nav_page_idx = -1
@@ -168,7 +184,7 @@ class TravelbookApp(Gtk.Window):
 
         self._build_ui()
         self.connect("size-allocate", self._on_window_size_allocate)
-        self._center_radar_view()
+        self._align_radar_view(force=True)
         self._load_diary_day(self.diary_date)
         self._fit_window_to_screen()
 
@@ -196,8 +212,22 @@ class TravelbookApp(Gtk.Window):
             return None
 
     def _on_destroy(self, *_):
+        self._release_screen_inhibit()
         self.compass_provider.close()
         Gtk.main_quit()
+
+    def _init_radar_scroll_tracking(self):
+        hadj = self.scroller.get_hadjustment()
+        vadj = self.scroller.get_vadjustment()
+        hadj.connect("value-changed", self._on_radar_adjustment_changed)
+        vadj.connect("value-changed", self._on_radar_adjustment_changed)
+
+    def _on_radar_adjustment_changed(self, _adjustment):
+        if self._programmatic_radar_scroll:
+            return
+        if not self.scroller.get_realized():
+            return
+        self._radar_user_has_panned = True
 
     def _detect_screen_resolution(self) -> Tuple[int, int]:
         try:
@@ -274,14 +304,16 @@ class TravelbookApp(Gtk.Window):
         action_row = Gtk.Box(spacing=8)
         refresh_btn = Gtk.Button(label="POIs neu laden")
         refresh_btn.connect("clicked", lambda *_: self._refresh_pois(force=True))
+        self.mode_toggle_btn = Gtk.Button()
+        self.mode_toggle_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.mode_toggle_btn.connect("clicked", self._on_mode_toggle_clicked)
         self.zoom_label = Gtk.Label(label="Zoom: 1.00x")
         self.zoom_label.set_xalign(0.0)
-        self.mode_box = Gtk.Box(spacing=4)
         self.mode_icon = Gtk.Image()
-        self.mode_box.pack_start(self.mode_icon, False, False, 0)
+        self.mode_toggle_btn.add(self.mode_icon)
         action_row.pack_start(refresh_btn, False, False, 0)
+        action_row.pack_start(self.mode_toggle_btn, False, False, 0)
         action_row.pack_start(self.zoom_label, True, True, 0)
-        action_row.pack_start(self.mode_box, False, False, 0)
         controls.pack_start(action_row, False, False, 0)
 
         self.status_label = Gtk.Label(label="Starte GPS...")
@@ -302,6 +334,7 @@ class TravelbookApp(Gtk.Window):
         self.scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.scroller.connect("size-allocate", self._on_scroller_size_allocate)
         self.scroller.add(self.radar_area)
+        self._init_radar_scroll_tracking()
         radar_page.pack_start(self.scroller, True, True, 0)
 
         self.poi_header_label = Gtk.Label(label="POIs im Auto-Radius")
@@ -635,10 +668,22 @@ class TravelbookApp(Gtk.Window):
         pixbuf = self._load_mode_icon(self.travel_mode)
         if pixbuf is not None:
             self.mode_icon.set_from_pixbuf(pixbuf)
-        self.mode_icon.set_tooltip_text(f"Modus: {mode_text} | Radius {radius} m")
+        mode_source = "manuell" if self.manual_travel_mode is not None else "auto"
+        tooltip = f"Modus: {mode_text} | Radius {radius} m | {mode_source} | Tippen zum Umschalten"
+        self.mode_icon.set_tooltip_text(tooltip)
+        if hasattr(self, "mode_toggle_btn"):
+            self.mode_toggle_btn.set_tooltip_text(tooltip)
         if hasattr(self, "poi_header_label"):
             suffix = " nur Staedte" if self.travel_mode == "drive" else ""
             self.poi_header_label.set_text(f"POIs im Auto-Radius ({mode_text}{suffix})")
+        self._sync_drive_mode_runtime_state()
+
+    def _on_mode_toggle_clicked(self, _button):
+        next_mode = "drive" if self.travel_mode != "drive" else "pedestrian"
+        self.manual_travel_mode = next_mode
+        self._set_travel_mode(next_mode)
+        self._update_mode_ui()
+        self._refresh_pois(force=True)
 
     def get_color_for_filter(self, filter_key: str) -> Tuple[float, float, float]:
         return self.category_colors.get(filter_key, UNKNOWN_COLOR)
@@ -649,22 +694,85 @@ class TravelbookApp(Gtk.Window):
         self.city_poi_store.clear()
         self.city_table_status_label.set_text(message)
 
-    def _center_radar_view(self):
-        def _center():
-            hadj = self.scroller.get_hadjustment()
-            vadj = self.scroller.get_vadjustment()
-            hadj.set_value((hadj.get_upper() - hadj.get_page_size()) / 2.0)
-            vadj.set_value((vadj.get_upper() - vadj.get_page_size()) / 2.0)
+    def _set_radar_scroll_position(self, force: bool = False):
+        if self._radar_user_has_panned and not force:
             return False
 
-        GLib.idle_add(_center)
+        hadj = self.scroller.get_hadjustment()
+        vadj = self.scroller.get_vadjustment()
+        page_width = float(hadj.get_page_size())
+        page_height = float(vadj.get_page_size())
+        content_width = float(hadj.get_upper())
+        content_height = float(vadj.get_upper())
+
+        if content_width <= 1.0 or content_height <= 1.0 or page_width <= 1.0 or page_height <= 1.0:
+            GLib.timeout_add(16, self._set_radar_scroll_position, force)
+            return False
+
+        point_x = content_width / 2.0
+        point_y = content_height / 2.0
+        if point_x <= 1.0 or point_y <= 1.0:
+            GLib.timeout_add(16, self._set_radar_scroll_position, force)
+            return False
+        max_x = max(0.0, content_width - page_width)
+        max_y = max(0.0, content_height - page_height)
+        target_x = max(0.0, min(max_x, point_x - (page_width / 2.0)))
+        target_y = max(0.0, min(max_y, point_y - (page_height / 2.0)))
+        self._trace_radar_viewport(
+            hadj=hadj,
+            vadj=vadj,
+            point_x=point_x,
+            point_y=point_y,
+            target_x=target_x,
+            target_y=target_y,
+            force=force,
+        )
+
+        self._programmatic_radar_scroll = True
+        try:
+            hadj.set_value(target_x)
+            vadj.set_value(target_y)
+        finally:
+            self._programmatic_radar_scroll = False
+        return False
+
+    def _align_radar_view(self, force: bool = False):
+        GLib.idle_add(self._set_radar_scroll_position, force)
+
+    def _trace_radar_viewport(self, *, hadj, vadj, point_x: float, point_y: float, target_x: float, target_y: float, force: bool):
+        now = time.time()
+        if (now - self._last_radar_viewport_trace_ts) < 0.5:
+            return
+        self._last_radar_viewport_trace_ts = now
+        request_width, request_height = self.radar_area.get_size_request()
+        allocation = self.radar_area.get_allocation()
+        LOGGER.info(
+            "radar viewport mode=%s force=%s hadj=(value=%.1f,page=%.1f,upper=%.1f) vadj=(value=%.1f,page=%.1f,upper=%.1f) "
+            "request=(%s,%s) allocation=(%s,%s) point=(%.1f,%.1f) target=(%.1f,%.1f)",
+            self.travel_mode,
+            force,
+            hadj.get_value(),
+            hadj.get_page_size(),
+            hadj.get_upper(),
+            vadj.get_value(),
+            vadj.get_page_size(),
+            vadj.get_upper(),
+            request_width,
+            request_height,
+            allocation.width,
+            allocation.height,
+            point_x,
+            point_y,
+            target_x,
+            target_y,
+        )
 
     def _on_scroller_size_allocate(self, _widget, allocation):
         target = max(MIN_CANVAS_SIZE, max(allocation.width, allocation.height) + CANVAS_PADDING * 2)
-        if target != self.radar_area.canvas_size:
-            self.radar_area.canvas_size = target
+        current_width, current_height = self.radar_area.get_size_request()
+        if target != current_width or target != current_height:
             self.radar_area.set_size_request(target, target)
-            self._center_radar_view()
+        self._align_radar_view(force=not self._radar_user_has_panned)
 
     def _on_window_size_allocate(self, _widget, allocation):
         self._apply_responsive_layout(allocation.width, allocation.height)
@@ -839,7 +947,7 @@ class TravelbookApp(Gtk.Window):
                         self.current_location = None
                         self.current_speed_mps = None
                         self.avg_speed_mps = None
-                        self.travel_mode = "pedestrian"
+                        self._set_travel_mode("pedestrian")
                         self.location_samples = []
                         self.pois = []
                         self._update_mode_ui()
@@ -887,6 +995,8 @@ class TravelbookApp(Gtk.Window):
             self._refresh_pois(force=False)
             self._refresh_region_info(force=False)
             self._refresh_navigation_view()
+            if self.travel_mode == "drive":
+                self._align_radar_view(force=True)
             self.radar_area.schedule_draw()
         except Exception:
             self.location_source = "none"
@@ -897,17 +1007,200 @@ class TravelbookApp(Gtk.Window):
     def _update_travel_metrics(self):
         if self.current_location is None or self.current_location_ts is None:
             self.avg_speed_mps = None
-            self.travel_mode = "pedestrian"
+            self._set_travel_mode("pedestrian")
             self.location_samples = []
             return
         if self.location_source == "gps":
             self.location_samples.append((self.current_location_ts, self.current_location))
             self.location_samples = trim_location_samples(self.location_samples, DRIVE_MODE_AVG_WINDOW_SECS)
         self.avg_speed_mps = average_speed_mps(self.location_samples, DRIVE_MODE_AVG_WINDOW_SECS, self._distance_m)
+        if self.manual_travel_mode is not None:
+            self._set_travel_mode(self.manual_travel_mode)
+            return
+        self._set_travel_mode(detect_travel_mode(self.current_speed_mps, self.avg_speed_mps))
+
+    def _set_travel_mode(self, mode: str):
+        if mode == self.travel_mode:
+            return
         previous_mode = self.travel_mode
-        self.travel_mode = detect_travel_mode(self.current_speed_mps, self.avg_speed_mps)
-        if previous_mode != self.travel_mode:
-            self.last_query_location = None
+        self.travel_mode = mode
+        self.last_query_location = None
+        if self.travel_mode == "drive":
+            self._radar_user_has_panned = False
+        if self.travel_mode == "drive" or previous_mode == "drive":
+            self._align_radar_view(force=True)
+
+    def _sync_drive_mode_runtime_state(self):
+        if self.travel_mode == "drive":
+            self._request_screen_inhibit()
+            self._set_drive_brightness()
+        else:
+            self._release_screen_inhibit()
+            self._restore_brightness()
+
+    def _set_drive_brightness(self):
+        if self.drive_brightness_applied:
+            return
+        if self._set_drive_brightness_via_sysfs():
+            self.drive_brightness_applied = True
+            return
+        if self._set_drive_brightness_via_brightnessctl():
+            self.drive_brightness_applied = True
+
+    def _restore_brightness(self):
+        if not self.drive_brightness_applied:
+            return
+        restored = self._restore_brightness_via_sysfs()
+        if not restored:
+            self._restore_brightness_via_brightnessctl()
+        self.drive_brightness_applied = False
+        self.saved_brightness_path = None
+        self.saved_brightness_value = None
+
+    def _backlight_device_path(self) -> Optional[Path]:
+        base = Path("/sys/class/backlight")
+        try:
+            devices = sorted(path for path in base.iterdir() if path.is_dir())
+        except Exception:
+            return None
+        return devices[0] if devices else None
+
+    def _set_drive_brightness_via_sysfs(self) -> bool:
+        device = self._backlight_device_path()
+        if device is None:
+            return False
+        brightness_path = device / "brightness"
+        max_path = device / "max_brightness"
+        try:
+            current_value = int(brightness_path.read_text(encoding="utf-8").strip())
+            max_value = int(max_path.read_text(encoding="utf-8").strip())
+            if self.saved_brightness_path is None:
+                self.saved_brightness_path = brightness_path
+                self.saved_brightness_value = current_value
+            brightness_path.write_text(f"{max_value}\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    def _restore_brightness_via_sysfs(self) -> bool:
+        if self.saved_brightness_path is None or self.saved_brightness_value is None:
+            return False
+        try:
+            self.saved_brightness_path.write_text(f"{self.saved_brightness_value}\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    def _set_drive_brightness_via_brightnessctl(self) -> bool:
+        try:
+            current_result = subprocess.run(
+                ["brightnessctl", "g"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if self.saved_brightness_value is None:
+                self.saved_brightness_value = int(current_result.stdout.strip())
+            subprocess.run(
+                ["brightnessctl", "s", "100%"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _restore_brightness_via_brightnessctl(self) -> bool:
+        if self.saved_brightness_value is None:
+            return False
+        try:
+            subprocess.run(
+                ["brightnessctl", "s", str(self.saved_brightness_value)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _request_screen_inhibit(self):
+        if self.screen_inhibit_cookie is not None:
+            return
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception:
+            return
+        try:
+            result = bus.call_sync(
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver",
+                "Inhibit",
+                GLib.Variant("(ss)", ("travelbook", "Drive mode active")),
+                GLib.VariantType("(u)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            self.screen_inhibit_cookie = int(result.unpack()[0])
+            self.screen_inhibit_method = "screensaver"
+            return
+        except Exception:
+            pass
+        try:
+            result = bus.call_sync(
+                "org.gnome.SessionManager",
+                "/org/gnome/SessionManager",
+                "org.gnome.SessionManager",
+                "Inhibit",
+                GLib.Variant("(susu)", (APP_ID, 0, "Drive mode active", 8)),
+                GLib.VariantType("(u)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            self.screen_inhibit_cookie = int(result.unpack()[0])
+            self.screen_inhibit_method = "session"
+        except Exception:
+            self.screen_inhibit_cookie = None
+            self.screen_inhibit_method = None
+
+    def _release_screen_inhibit(self):
+        if self.screen_inhibit_cookie is None or self.screen_inhibit_method is None:
+            return
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            if self.screen_inhibit_method == "screensaver":
+                bus.call_sync(
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    "org.freedesktop.ScreenSaver",
+                    "UnInhibit",
+                    GLib.Variant("(u)", (self.screen_inhibit_cookie,)),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    3000,
+                    None,
+                )
+            else:
+                bus.call_sync(
+                    "org.gnome.SessionManager",
+                    "/org/gnome/SessionManager",
+                    "org.gnome.SessionManager",
+                    "Uninhibit",
+                    GLib.Variant("(u)", (self.screen_inhibit_cookie,)),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    3000,
+                    None,
+                )
+        except Exception:
+            pass
+        finally:
+            self.screen_inhibit_cookie = None
+            self.screen_inhibit_method = None
 
     def _refresh_region_info(self, force: bool):
         if self.current_location is None or self.region_fetch_in_progress:
