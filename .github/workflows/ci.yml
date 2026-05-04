@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gir1.2-gtk-3.0 \
+            python3 \
+            python3-gi \
+            python3-gi-cairo \
+            python3-requests \
+            python3-pydbus
+
+      - name: Compile Python sources
+        run: |
+          python3 -m compileall \
+            travelbook.py \
+            travelbook_core.py \
+            travelbook_providers.py \
+            travelbook_services.py \
+            travelbook_widgets.py \
+            tests \
+            community/travelbook
+
+      - name: Run tests
+        run: |
+          python3 -m unittest \
+            tests.test_poi_query \
+            tests.test_providers \
+            tests.test_services \
+            community/travelbook/test_services.py
+
+  apkbuild:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+
+    steps:
+      - name: Install packaging tools
+        run: apk add --no-cache alpine-sdk bash
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate APKBUILD checksums
+        run: |
+          cd community/travelbook
+          abuild checksum
+          git diff --exit-code APKBUILD
