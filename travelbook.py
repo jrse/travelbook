@@ -31,6 +31,7 @@ from travelbook_core import (
     RADAR_HEADING_REDRAW_THRESHOLD_DEG,
     REGION_REFRESH_MOVE_M,
     REGION_REFRESH_SECS,
+    WHISPER_BASE_URL_DEFAULT,
     UNKNOWN_COLOR,
     Cluster,
     Poi,
@@ -41,11 +42,15 @@ from travelbook_core import (
 )
 from travelbook_providers import CompassProvider, GeoClueProvider
 from travelbook_services import (
+    AudioRecordingError,
+    AudioRecordingSession,
+    AudioTranscriptionError,
     DiaryImproveError,
     PoiFetchError,
     average_speed_mps,
     assign_clusters,
     bearing_deg,
+    cleanup_audio_recording,
     calculate_speed_mps,
     calculate_navigation_info,
     detect_travel_mode,
@@ -65,7 +70,11 @@ from travelbook_services import (
     save_diary_entries,
     save_app_settings,
     should_refresh_pois,
+    start_audio_recording,
+    stop_audio_recording,
+    transcribe_audio_file,
     trim_location_samples,
+    restore_audio_card_profile,
 )
 from travelbook_widgets import NavigationArea, RadarArea
 
@@ -157,12 +166,22 @@ class TravelbookApp(Gtk.Window):
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
         self.diary_dir = self.app_data_dir / "diary"
         self.diary_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_dir = self.app_data_dir / "audio"
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.app_settings = load_app_settings(self.app_data_dir)
         self.ollama_base_url = self.app_settings.get("ollama_base_url", OLLAMA_BASE_URL_DEFAULT)
         self.ollama_diary_system_prompt = self.app_settings.get(
             "ollama_diary_system_prompt",
             OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
         )
+        self.whisper_base_url = self.app_settings.get("whisper_base_url", WHISPER_BASE_URL_DEFAULT)
+        self.audio_recording_session: Optional[AudioRecordingSession] = None
+        self.audio_transcription_busy = False
+        self.recording_dialog: Optional[Gtk.Dialog] = None
+        self.recording_dialog_device_label: Optional[Gtk.Label] = None
+        self.recording_dialog_status_label: Optional[Gtk.Label] = None
+        self.recording_dialog_time_label: Optional[Gtk.Label] = None
+        self.recording_timer_source_id: Optional[int] = None
 
         self.categories: Dict[str, bool] = {osm_filter: enabled for _label, osm_filter, enabled in POI_OPTIONS}
         self.category_labels: Dict[str, str] = {osm_filter: label for label, osm_filter, _ in POI_OPTIONS}
@@ -212,6 +231,8 @@ class TravelbookApp(Gtk.Window):
             return None
 
     def _on_destroy(self, *_):
+        self._close_recording_dialog()
+        self._stop_active_recording()
         self._release_screen_inhibit()
         self.compass_provider.close()
         Gtk.main_quit()
@@ -372,6 +393,11 @@ class TravelbookApp(Gtk.Window):
         self.ollama_base_url_entry = Gtk.Entry()
         self.ollama_base_url_entry.set_text(self.ollama_base_url)
         profile_page.pack_start(self.ollama_base_url_entry, False, False, 0)
+
+        profile_page.pack_start(Gtk.Label(label="Whisper Basis-URL"), False, False, 0)
+        self.whisper_base_url_entry = Gtk.Entry()
+        self.whisper_base_url_entry.set_text(self.whisper_base_url)
+        profile_page.pack_start(self.whisper_base_url_entry, False, False, 0)
 
         profile_page.pack_start(Gtk.Label(label="Ollama System-Prompt für Tagebuch"), False, False, 0)
         self.ollama_prompt_view = Gtk.TextView()
@@ -550,6 +576,9 @@ class TravelbookApp(Gtk.Window):
         diary_clear_btn.connect("clicked", self._on_diary_clear_edit)
         self.diary_clear_btn = diary_clear_btn
         diary_btn_row.pack_start(self.diary_clear_btn, False, False, 0)
+        self.diary_record_btn = Gtk.Button(label="Aufnahme starten")
+        self.diary_record_btn.connect("clicked", self._on_diary_record_clicked)
+        diary_btn_row.pack_start(self.diary_record_btn, False, False, 0)
         diary_editor_page.pack_start(diary_btn_row, False, False, 0)
 
         diary_history_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1430,6 +1459,10 @@ class TravelbookApp(Gtk.Window):
             self.diary_save_btn.set_sensitive(not busy)
         if hasattr(self, "diary_clear_btn"):
             self.diary_clear_btn.set_sensitive(not busy)
+        if hasattr(self, "diary_record_btn"):
+            recording = self.audio_recording_session is not None
+            self.diary_record_btn.set_label("Aufnahme stoppen" if recording else "Aufnahme starten")
+            self.diary_record_btn.set_sensitive(recording or not busy)
         if hasattr(self, "diary_textview"):
             self.diary_textview.set_editable(not busy)
             self.diary_textview.set_cursor_visible(not busy)
@@ -1489,18 +1522,201 @@ class TravelbookApp(Gtk.Window):
         )
         thread.start()
 
+    def _on_diary_record_clicked(self, *_):
+        if self.audio_recording_session is not None:
+            self._finish_diary_recording()
+            return
+        if self.audio_transcription_busy:
+            self._set_status("Audio wird noch verarbeitet")
+            return
+        try:
+            self.audio_recording_session = start_audio_recording(self.audio_dir)
+        except AudioRecordingError as exc:
+            self._set_status(exc.user_message)
+            self.audio_recording_session = None
+            self._set_diary_busy(False)
+            return
+
+        source_name = self.audio_recording_session.source_label
+        self._show_recording_dialog(self.audio_recording_session)
+        self._set_diary_busy(False)
+        self._set_status(f"Audioaufnahme läuft ({source_name})")
+
+    def _finish_diary_recording(self):
+        session = self.audio_recording_session
+        if session is None:
+            return
+        LOGGER.warning(
+            "Diary recording finish requested source=%s started_at=%s",
+            session.source_name or "-",
+            session.started_at,
+        )
+        self.audio_recording_session = None
+        self._close_recording_dialog()
+        self.audio_transcription_busy = True
+        self._set_diary_busy(True)
+        self._set_status("Audio wird in Text umgewandelt")
+        thread = threading.Thread(target=self._transcribe_recording_thread, args=(session,), daemon=True)
+        thread.start()
+
+    def _stop_active_recording(self):
+        session = self.audio_recording_session
+        if session is None:
+            return
+        self.audio_recording_session = None
+        self._close_recording_dialog()
+        try:
+            if session.process.poll() is None:
+                session.process.terminate()
+                session.process.communicate(timeout=2)
+        except Exception:
+            try:
+                session.process.kill()
+            except Exception:
+                pass
+        finally:
+            try:
+                session.wav_handle.close()
+            except Exception:
+                pass
+            restore_audio_card_profile(session)
+            cleanup_audio_recording(session)
+
+    def _show_recording_dialog(self, session: AudioRecordingSession):
+        self._close_recording_dialog()
+        dialog = Gtk.Dialog(title="Audioaufnahme", parent=self, flags=0)
+        dialog.set_modal(False)
+        dialog.set_destroy_with_parent(True)
+        dialog.set_resizable(False)
+        dialog.connect("delete-event", self._on_recording_dialog_delete)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_border_width(10)
+
+        device_label = Gtk.Label(label=f"Gerät: {session.source_label}")
+        device_label.set_xalign(0.0)
+        device_label.set_line_wrap(True)
+        content.pack_start(device_label, False, False, 0)
+
+        status_text = "Status: Bluetooth-Mikrofon aktiv"
+        if session.switched_card_profile:
+            status_text = "Status: Headset auf Mikrofonmodus umgeschaltet (HFP)"
+        status_label = Gtk.Label(label=status_text)
+        status_label.set_xalign(0.0)
+        status_label.set_line_wrap(True)
+        content.pack_start(status_label, False, False, 0)
+
+        time_label = Gtk.Label(label="Dauer: 00:00")
+        time_label.set_xalign(0.0)
+        content.pack_start(time_label, False, False, 0)
+
+        stop_btn = Gtk.Button(label="Aufnahme stoppen")
+        stop_btn.connect("clicked", self._on_diary_record_clicked)
+        content.pack_start(stop_btn, False, False, 0)
+
+        self.recording_dialog = dialog
+        self.recording_dialog_device_label = device_label
+        self.recording_dialog_status_label = status_label
+        self.recording_dialog_time_label = time_label
+        self._update_recording_dialog_time()
+        self.recording_timer_source_id = GLib.timeout_add(1000, self._update_recording_dialog_time)
+        dialog.show_all()
+
+    def _close_recording_dialog(self):
+        if self.recording_timer_source_id is not None:
+            GLib.source_remove(self.recording_timer_source_id)
+            self.recording_timer_source_id = None
+        dialog = self.recording_dialog
+        self.recording_dialog = None
+        self.recording_dialog_device_label = None
+        self.recording_dialog_status_label = None
+        self.recording_dialog_time_label = None
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+    def _on_recording_dialog_delete(self, *_args):
+        if self.audio_recording_session is not None:
+            self._finish_diary_recording()
+        return True
+
+    def _update_recording_dialog_time(self):
+        session = self.audio_recording_session
+        label = self.recording_dialog_time_label
+        if session is None or label is None:
+            self.recording_timer_source_id = None
+            return False
+        elapsed = max(0, int(time.time() - session.started_at))
+        minutes, seconds = divmod(elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            value = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            value = f"{minutes:02d}:{seconds:02d}"
+        label.set_text(f"Dauer: {value}")
+        return True
+
+    def _transcribe_recording_thread(self, session: AudioRecordingSession):
+        try:
+            LOGGER.warning("Diary transcription thread started wav=%s", session.wav_path)
+            mp3_path = stop_audio_recording(session)
+            LOGGER.warning("Diary transcription thread sending mp3=%s whisper_base_url=%s", mp3_path, self.whisper_base_url)
+            transcript = transcribe_audio_file(mp3_path, base_url=self.whisper_base_url)
+            LOGGER.warning("Diary transcription thread received transcript_chars=%s", len(transcript))
+            GLib.idle_add(self._apply_transcript_result, session, transcript)
+            return
+        except AudioRecordingError as exc:
+            LOGGER.exception("Diary transcription failed during recording stop/conversion")
+            GLib.idle_add(self._apply_transcript_failure, session, exc.user_message)
+            return
+        except AudioTranscriptionError as exc:
+            LOGGER.exception("Diary transcription failed during Whisper request")
+            GLib.idle_add(self._apply_transcript_failure, session, exc.user_message)
+            return
+        except Exception:
+            LOGGER.exception("Diary transcription failed unexpectedly")
+            GLib.idle_add(self._apply_transcript_failure, session, "Audio konnte nicht transkribiert werden.")
+
+    def _apply_transcript_result(self, session: AudioRecordingSession, transcript: str):
+        self.audio_transcription_busy = False
+        buf = self.diary_textview.get_buffer()
+        current_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
+        next_text = transcript.strip()
+        if current_text:
+            next_text = f"{current_text}\n{next_text}"
+        buf.set_text(next_text)
+        cleanup_audio_recording(session)
+        self._set_diary_busy(False)
+        self._show_diary_editor()
+        self._focus_diary_editor()
+        self._set_status("Tagebuchtext aus Audio übernommen")
+        return False
+
+    def _apply_transcript_failure(self, session: AudioRecordingSession, message: str):
+        self.audio_transcription_busy = False
+        cleanup_audio_recording(session)
+        self._set_diary_busy(False)
+        self._set_status(message)
+        return False
+
     def _on_ollama_settings_save(self, *_):
         prompt_buffer = self.ollama_prompt_view.get_buffer()
         prompt = prompt_buffer.get_text(prompt_buffer.get_start_iter(), prompt_buffer.get_end_iter(), True).strip()
         base_url = self.ollama_base_url_entry.get_text().strip() or OLLAMA_BASE_URL_DEFAULT
+        whisper_base_url = self.whisper_base_url_entry.get_text().strip() or WHISPER_BASE_URL_DEFAULT
         self.ollama_base_url = base_url
+        self.whisper_base_url = whisper_base_url
         self.ollama_diary_system_prompt = prompt or OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT
         self.app_settings = {
             "ollama_base_url": self.ollama_base_url,
             "ollama_diary_system_prompt": self.ollama_diary_system_prompt,
+            "whisper_base_url": self.whisper_base_url,
         }
         save_app_settings(self.app_data_dir, self.app_settings)
-        self._set_status("Ollama-Einstellungen gespeichert")
+        self._set_status("Ollama- und Whisper-Einstellungen gespeichert")
 
     def _diary_save_thread(
         self,

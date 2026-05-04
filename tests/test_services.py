@@ -1,17 +1,24 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from datetime import date
 from pathlib import Path
 
 from travelbook_core import Poi, compute_runtime_indicators, format_fix_age
 from travelbook_services import (
+    AudioRecordingSession,
+    AudioTranscriptionError,
     DiaryImproveError,
     PoiFetchError,
     average_speed_mps,
     assign_clusters,
     calculate_speed_mps,
     calculate_navigation_info,
+    cleanup_audio_recording,
+    describe_audio_input_source,
+    discover_rnnoise_model,
+    discover_bluetooth_input_source,
     detect_travel_mode,
     derive_travel_heading,
     effective_query_radius,
@@ -27,8 +34,13 @@ from travelbook_services import (
     resolve_region,
     save_app_settings,
     save_diary_entries,
+    start_audio_recording,
+    stop_audio_recording,
     should_refresh_pois,
+    transcribe_audio_file,
     trim_location_samples,
+    whisper_transcribe_url,
+    ensure_bluetooth_input_source,
 )
 
 
@@ -37,6 +49,7 @@ class FakeResponse:
         self.payload = payload
         self.text = ""
         self.status_code = 200
+        self.headers = {"Content-Type": "application/json"}
 
     def raise_for_status(self):
         return None
@@ -130,6 +143,7 @@ class TestServices(unittest.TestCase):
                 {
                     "ollama_base_url": "http://192.168.178.48",
                     "ollama_diary_system_prompt": "rewrite diary entries",
+                    "whisper_base_url": "http://192.168.178.153:8000",
                 },
             )
 
@@ -137,10 +151,230 @@ class TestServices(unittest.TestCase):
 
             self.assertEqual("http://192.168.178.48", loaded["ollama_base_url"])
             self.assertEqual("rewrite diary entries", loaded["ollama_diary_system_prompt"])
+            self.assertEqual("http://192.168.178.153:8000", loaded["whisper_base_url"])
 
     def test_ollama_generate_url_accepts_plain_and_api_base_urls(self):
         self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48"))
         self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48/api"))
+
+    def test_whisper_transcribe_url_appends_default_endpoint_only_for_bare_host(self):
+        self.assertEqual("http://192.168.178.153:8000/transcribe", whisper_transcribe_url("http://192.168.178.153:8000"))
+        self.assertEqual(
+            "http://192.168.178.153:8000/api/transcribe",
+            whisper_transcribe_url("http://192.168.178.153:8000/api/transcribe"),
+        )
+
+    def test_discover_bluetooth_input_source_prefers_bluez_source(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: alsa_input.platform-device.analog-stereo\n"
+                "\tDescription: Internal Mic\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"alsa\"\n"
+                "Source #2\n"
+                "\tName: bluez_input.00_11_22_33_44_55.0\n"
+                "\tDescription: Jabra Elite 45h\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            )
+        )
+
+        source = discover_bluetooth_input_source(command_runner=lambda *_args, **_kwargs: result)
+
+        self.assertEqual("bluez_input.00_11_22_33_44_55.0", source)
+
+    def test_discover_bluetooth_input_source_ignores_monitor_sources(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: bluez_sink.FA_1B_A3_7D_14_E7.a2dp_sink.monitor\n"
+                "\tDescription: Monitor of Intenso Buds Plus\n"
+                "\tdevice.class = \"monitor\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            )
+        )
+
+        source = discover_bluetooth_input_source(command_runner=lambda *_args, **_kwargs: result)
+
+        self.assertIsNone(source)
+
+    def test_describe_audio_input_source_prefers_pactl_description(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: bluez_input.00_11_22_33_44_55.0\n"
+                "\tDescription: Jabra Elite 45h\n"
+            )
+        )
+
+        label = describe_audio_input_source(
+            "bluez_input.00_11_22_33_44_55.0",
+            command_runner=lambda *_args, **_kwargs: result,
+        )
+
+        self.assertEqual("Jabra Elite 45h", label)
+
+    def test_describe_audio_input_source_formats_bluez_name_without_pactl_details(self):
+        label = describe_audio_input_source(
+            "bluez_input.00_11_22_33_44_55.0",
+            command_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("missing pactl")),
+        )
+
+        self.assertEqual("00 11 22 33 44 55 0", label)
+
+    def test_discover_rnnoise_model_returns_first_existing_candidate(self):
+        with patch("travelbook_services.RNNOISE_MODEL_CANDIDATES", ("/missing.rnnn", "/present.rnnn")):
+            with patch.object(Path, "exists", new=lambda path: str(path) == "/present.rnnn"):
+                model = discover_rnnoise_model()
+
+        self.assertEqual(Path("/present.rnnn"), model)
+
+    def test_start_and_stop_audio_recording_uses_parec_and_converts_to_mp3(self):
+        commands = []
+
+        class FakeProcess:
+            def __init__(self, command):
+                self.command = command
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.returncode = -15
+
+            def communicate(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return ("", "")
+
+        def fake_popen(command, stdout=None, stderr=None):
+            commands.append(command)
+            self.assertIsNotNone(stdout)
+            self.assertIsNotNone(stderr)
+            return FakeProcess(command)
+
+        source_details = (
+            "Source #1\n"
+            "\tName: bluez_input.headset\n"
+            "\tDescription: Headset\n"
+            "\tdevice.class = \"sound\"\n"
+            "\tdevice.api = \"bluez\"\n"
+        )
+
+        def fake_run(command, check=None, capture_output=None, text=None):
+            commands.append(command)
+            if command == ["pactl", "list", "sources"]:
+                return SimpleNamespace(stdout=source_details)
+            if command == ["pactl", "list", "cards"]:
+                return SimpleNamespace(stdout="")
+            return SimpleNamespace(stdout="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("travelbook_services.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                with patch("travelbook_services.discover_rnnoise_model", return_value=Path("/models/rnnoise.rnnn")):
+                    session = start_audio_recording(
+                        Path(tmp),
+                        source_name="bluez_input.headset",
+                        popen_factory=fake_popen,
+                        command_runner=fake_run,
+                    )
+                    mp3_path = stop_audio_recording(session, command_runner=fake_run)
+
+                    self.assertEqual(".mp3", mp3_path.suffix)
+                    self.assertEqual(["pactl", "list", "sources"], commands[0])
+                    self.assertIn("--device=bluez_input.headset", commands[1])
+                    self.assertEqual("Headset", session.source_label)
+                    self.assertEqual("/usr/bin/ffmpeg", commands[2][0])
+                    self.assertIn("arnndn=model=/models/rnnoise.rnnn", commands[2])
+                    cleanup_audio_recording(session)
+
+    def test_ensure_bluetooth_input_source_switches_card_profile_when_only_a2dp_monitor_exists(self):
+        commands = []
+        source_outputs = [
+            (
+                "Source #1\n"
+                "\tName: bluez_sink.FA_1B_A3_7D_14_E7.a2dp_sink.monitor\n"
+                "\tDescription: Monitor of Intenso Buds Plus\n"
+                "\tdevice.class = \"monitor\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            ),
+            (
+                "Source #1\n"
+                "\tName: bluez_input.FA_1B_A3_7D_14_E7.handsfree_head_unit\n"
+                "\tDescription: Intenso Buds Plus\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            ),
+        ]
+        source_index = {"value": 0}
+        cards_output = (
+            "Card #0\n"
+            "\tName: bluez_card.FA_1B_A3_7D_14_E7\n"
+            "\tdevice.description = \"Intenso Buds Plus\"\n"
+            "\tbluez.alias = \"Intenso Buds Plus\"\n"
+            "\tActive Profile: a2dp_sink\n"
+            "\tProfiles:\n"
+            "\t\ta2dp_sink: High Fidelity Playback (A2DP Sink)\n"
+            "\t\thandsfree_head_unit: Handsfree Head Unit (HFP)\n"
+        )
+
+        def fake_run(command, check=None, capture_output=None, text=None):
+            commands.append(command)
+            if command == ["pactl", "list", "sources"]:
+                value = source_outputs[min(source_index["value"], len(source_outputs) - 1)]
+                if source_index["value"] == 0:
+                    source_index["value"] += 1
+                return SimpleNamespace(stdout=value)
+            if command == ["pactl", "list", "short", "sources"]:
+                return SimpleNamespace(stdout="")
+            if command == ["pactl", "list", "cards"]:
+                return SimpleNamespace(stdout=cards_output)
+            if command == ["pactl", "set-card-profile", "bluez_card.FA_1B_A3_7D_14_E7", "handsfree_head_unit"]:
+                return SimpleNamespace(stdout="")
+            raise AssertionError(command)
+
+        with patch("travelbook_services.time.sleep", return_value=None):
+            source_name, card_name, previous_profile, switched = ensure_bluetooth_input_source(command_runner=fake_run)
+
+        self.assertEqual("bluez_input.FA_1B_A3_7D_14_E7.handsfree_head_unit", source_name)
+        self.assertEqual("bluez_card.FA_1B_A3_7D_14_E7", card_name)
+        self.assertEqual("a2dp_sink", previous_profile)
+        self.assertEqual(True, switched)
+        self.assertIn(["pactl", "set-card-profile", "bluez_card.FA_1B_A3_7D_14_E7", "handsfree_head_unit"], commands)
+
+    def test_transcribe_audio_file_reads_text_from_json_response(self):
+        calls = {}
+
+        def fake_post(url, files=None, headers=None, timeout=None):
+            calls["url"] = url
+            calls["files"] = files
+            calls["headers"] = headers
+            calls["timeout"] = timeout
+            return FakeResponse({"text": "Heute war ich unterwegs."})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "entry.mp3"
+            audio_path.write_bytes(b"mp3")
+
+            transcript = transcribe_audio_file(audio_path, base_url="http://192.168.178.153:8000", http_post=fake_post)
+
+            self.assertEqual("Heute war ich unterwegs.", transcript)
+            self.assertEqual("http://192.168.178.153:8000/transcribe", calls["url"])
+            self.assertEqual("audio/mpeg", calls["files"]["file"][2])
+
+    def test_transcribe_audio_file_raises_when_text_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "entry.mp3"
+            audio_path.write_bytes(b"mp3")
+
+            with self.assertRaises(AudioTranscriptionError):
+                transcribe_audio_file(
+                    audio_path,
+                    base_url="http://192.168.178.153:8000",
+                    http_post=lambda *_args, **_kwargs: FakeResponse({"segments": []}),
+                )
 
     def test_improve_diary_entry_accumulates_streamed_response(self):
         calls = {}

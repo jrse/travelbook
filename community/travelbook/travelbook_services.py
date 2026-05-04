@@ -1,10 +1,14 @@
 import json
 import logging
 import math
+import shutil
+import subprocess
 import time
+import uuid
 from datetime import date, datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, IO, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import requests
@@ -39,7 +43,13 @@ from travelbook_core import (
     POI_REFRESH_RADIUS_FACTOR,
     POI_SPEED_EXTENSION_MIN_MPS,
     POI_SPEED_LOOKAHEAD_SECS,
+    RECORDER_CHANNELS,
+    RECORDER_SAMPLE_RATE,
+    RNNOISE_MODEL_CANDIDATES,
     TRAVEL_HEADING_MIN_MOVE_M,
+    WHISPER_BASE_URL_DEFAULT,
+    WHISPER_CONNECT_TIMEOUT_SECS,
+    WHISPER_READ_TIMEOUT_SECS,
     Cluster,
     Poi,
     build_overpass_query,
@@ -61,6 +71,32 @@ class DiaryImproveError(RuntimeError):
     def __init__(self, user_message: str):
         super().__init__(user_message)
         self.user_message = user_message
+
+
+class AudioRecordingError(RuntimeError):
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
+class AudioTranscriptionError(RuntimeError):
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
+@dataclass
+class AudioRecordingSession:
+    wav_path: Path
+    mp3_path: Path
+    source_name: Optional[str]
+    source_label: str
+    card_name: Optional[str]
+    previous_card_profile: Optional[str]
+    switched_card_profile: bool
+    process: subprocess.Popen
+    wav_handle: IO[bytes]
+    started_at: float
 
 
 OVERPASS_FILTER_BATCH_SIZE = 24
@@ -211,6 +247,7 @@ def load_app_settings(base_dir: Path) -> Dict[str, str]:
     defaults = {
         "ollama_base_url": OLLAMA_BASE_URL_DEFAULT,
         "ollama_diary_system_prompt": OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT,
+        "whisper_base_url": WHISPER_BASE_URL_DEFAULT,
     }
     path = settings_file_path(base_dir)
     if not path.exists():
@@ -236,8 +273,502 @@ def save_app_settings(base_dir: Path, settings: Dict[str, str]) -> None:
         "ollama_diary_system_prompt": str(
             settings.get("ollama_diary_system_prompt", OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT)
         ).strip(),
+        "whisper_base_url": str(settings.get("whisper_base_url", WHISPER_BASE_URL_DEFAULT)).strip(),
     }
     settings_file_path(base_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def whisper_transcribe_url(base_url: str) -> str:
+    normalized = (base_url or WHISPER_BASE_URL_DEFAULT).strip().rstrip("/")
+    if not normalized:
+        normalized = WHISPER_BASE_URL_DEFAULT
+    tail = normalized.rsplit("/", 1)[-1].lower()
+    if tail in {"transcribe", "transcription"}:
+        return normalized
+    scheme_split = normalized.split("://", 1)
+    path_part = scheme_split[1] if len(scheme_split) == 2 else scheme_split[0]
+    if "/" in path_part:
+        return normalized
+    return f"{normalized}/transcribe"
+
+
+def _run_audio_command(command: List[str], command_runner=subprocess.run) -> subprocess.CompletedProcess:
+    return command_runner(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def discover_rnnoise_model() -> Optional[Path]:
+    for candidate in RNNOISE_MODEL_CANDIDATES:
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def _parse_pactl_blocks(text: str, header_prefix: str) -> List[List[str]]:
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    for line in text.splitlines():
+        if line.startswith(header_prefix):
+            if current:
+                blocks.append(current)
+            current = [line]
+            continue
+        if current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _parse_pactl_key_values(block: List[str]) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for raw_line in block:
+        stripped = raw_line.strip()
+        if ": " in stripped:
+            key, value = stripped.split(": ", 1)
+            values[key] = value.strip()
+        elif " = " in stripped:
+            key, value = stripped.split(" = ", 1)
+            values[key] = value.strip().strip('"')
+    return values
+
+
+def list_audio_sources(command_runner=subprocess.run) -> List[Dict[str, str]]:
+    try:
+        result = _run_audio_command(["pactl", "list", "sources"], command_runner=command_runner)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sources: List[Dict[str, str]] = []
+    for block in _parse_pactl_blocks(result.stdout, "Source #"):
+        values = _parse_pactl_key_values(block)
+        if values:
+            sources.append(values)
+    return sources
+
+
+def list_audio_cards(command_runner=subprocess.run) -> List[Dict[str, str]]:
+    try:
+        result = _run_audio_command(["pactl", "list", "cards"], command_runner=command_runner)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    cards: List[Dict[str, str]] = []
+    for block in _parse_pactl_blocks(result.stdout, "Card #"):
+        values = _parse_pactl_key_values(block)
+        if values:
+            cards.append(values)
+    return cards
+
+
+def discover_bluetooth_input_source(command_runner=subprocess.run) -> Optional[str]:
+    sources = list_audio_sources(command_runner=command_runner)
+    LOGGER.info("Audio source discovery: found %s detailed sources", len(sources))
+    for source in sources:
+        source_name = source.get("Name", "").strip()
+        source_class = source.get("device.class", "").strip().lower()
+        device_api = source.get("device.api", "").strip().lower()
+        description = source.get("Description", "").strip()
+        LOGGER.info(
+            "Audio source candidate name=%s description=%s class=%s api=%s",
+            source_name or "-",
+            description or "-",
+            source_class or "-",
+            device_api or "-",
+        )
+        if not source_name:
+            continue
+        if source_class == "monitor" or ".monitor" in source_name.lower():
+            continue
+        if device_api == "bluez" or source_name.lower().startswith("bluez_input."):
+            LOGGER.info("Audio source discovery selected bluetooth source=%s", source_name)
+            return source_name
+
+    try:
+        result = _run_audio_command(["pactl", "list", "short", "sources"], command_runner=command_runner)
+    except (OSError, subprocess.SubprocessError):
+        LOGGER.warning("Audio source discovery failed: unable to query short sources")
+        return None
+
+    for raw_line in result.stdout.splitlines():
+        columns = raw_line.split("\t")
+        if len(columns) < 2:
+            continue
+        source_name = columns[1].strip()
+        lowered = source_name.lower()
+        LOGGER.info("Audio short source candidate name=%s", source_name)
+        if ".monitor" in lowered:
+            continue
+        if "bluez_input" in lowered:
+            LOGGER.info("Audio short source selected bluetooth source=%s", source_name)
+            return source_name
+    LOGGER.warning("Audio source discovery found no bluetooth microphone source")
+    return None
+
+
+def describe_audio_input_source(source_name: Optional[str], command_runner=subprocess.run) -> str:
+    if not source_name:
+        return "Standardmikrofon"
+    try:
+        result = command_runner(
+            ["pactl", "list", "sources"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+
+    if result is not None:
+        current_name = None
+        current_description = None
+        for raw_line in result.stdout.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("Name: "):
+                current_name = stripped.split("Name: ", 1)[1].strip()
+                current_description = None
+                continue
+            if stripped.startswith("Description: "):
+                current_description = stripped.split("Description: ", 1)[1].strip()
+            if current_name == source_name and current_description:
+                return current_description
+
+    label = source_name
+    if source_name.startswith("bluez_input."):
+        label = source_name.split("bluez_input.", 1)[1]
+    label = label.replace(".monitor", "")
+    label = label.replace(".", " ")
+    label = label.replace("_", " ")
+    return label.strip() or source_name
+
+
+def ensure_bluetooth_input_source(command_runner=subprocess.run) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
+    current_source = discover_bluetooth_input_source(command_runner=command_runner)
+    if current_source:
+        for card in list_audio_cards(command_runner=command_runner):
+            active_profile = card.get("Active Profile")
+            card_name = card.get("Name")
+            if card_name and card_name.startswith("bluez_card."):
+                return current_source, card_name, active_profile, False
+        return current_source, None, None, False
+
+    cards = list_audio_cards(command_runner=command_runner)
+    LOGGER.info("Bluetooth input fallback: inspecting %s cards", len(cards))
+    for card in cards:
+        card_name = card.get("Name", "").strip()
+        active_profile = card.get("Active Profile", "").strip()
+        alias = card.get("bluez.alias", "").strip() or card.get("device.description", "").strip()
+        if not card_name.startswith("bluez_card."):
+            continue
+        LOGGER.info(
+            "Bluetooth card candidate name=%s alias=%s active_profile=%s",
+            card_name,
+            alias or "-",
+            active_profile or "-",
+        )
+        if active_profile == "handsfree_head_unit":
+            continue
+        profiles_blob = "\n".join(f"{key}: {value}" for key, value in card.items())
+        if "handsfree_head_unit" not in profiles_blob:
+            continue
+        try:
+            LOGGER.warning(
+                "Switching bluetooth card %s (%s) from profile %s to handsfree_head_unit for microphone recording",
+                card_name,
+                alias or "-",
+                active_profile or "-",
+            )
+            _run_audio_command(["pactl", "set-card-profile", card_name, "handsfree_head_unit"], command_runner=command_runner)
+        except (OSError, subprocess.SubprocessError):
+            LOGGER.exception("Failed to switch bluetooth card profile for %s", card_name)
+            continue
+        time.sleep(1.0)
+        current_source = discover_bluetooth_input_source(command_runner=command_runner)
+        if current_source:
+            LOGGER.info("Bluetooth input became available after profile switch: source=%s", current_source)
+            return current_source, card_name, active_profile or None, True
+    LOGGER.warning("No bluetooth microphone source is available after profile checks")
+    return None, None, None, False
+
+
+def start_audio_recording(
+    output_dir: Path,
+    *,
+    source_name: Optional[str] = None,
+    popen_factory=subprocess.Popen,
+    command_runner=subprocess.run,
+    time_fn=time.time,
+) -> AudioRecordingSession:
+    parec_path = shutil.which("parec")
+    if not parec_path:
+        raise AudioRecordingError("`parec` ist nicht installiert.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    recording_id = str(uuid.uuid4())
+    wav_path = output_dir / f"{recording_id}.wav"
+    mp3_path = output_dir / f"{recording_id}.mp3"
+    previous_card_profile = None
+    card_name = None
+    switched_card_profile = False
+    if source_name:
+        selected_source = source_name
+    else:
+        selected_source, card_name, previous_card_profile, switched_card_profile = ensure_bluetooth_input_source(
+            command_runner=command_runner
+        )
+    if not selected_source:
+        LOGGER.warning("Audio recording start aborted: no bluetooth microphone source available")
+        raise AudioRecordingError(
+            "Kein Bluetooth-Mikrofon verfügbar. Aktuell ist vermutlich nur A2DP aktiv; bitte Headset/HFP aktivieren."
+        )
+    source_label = describe_audio_input_source(selected_source, command_runner=command_runner)
+    LOGGER.warning(
+        "Audio recording start source=%s label=%s card=%s previous_profile=%s switched=%s",
+        selected_source,
+        source_label,
+        card_name or "-",
+        previous_card_profile or "-",
+        switched_card_profile,
+    )
+    wav_handle = wav_path.open("wb")
+    command = [
+        parec_path,
+        "--record",
+        "--format=s16le",
+        f"--rate={RECORDER_SAMPLE_RATE}",
+        f"--channels={RECORDER_CHANNELS}",
+        "--file-format=wav",
+        "--client-name=travelbook",
+        "--stream-name=travelbook-diary",
+    ]
+    if selected_source:
+        command.append(f"--device={selected_source}")
+
+    try:
+        process = popen_factory(command, stdout=wav_handle, stderr=subprocess.PIPE)
+    except OSError as exc:
+        wav_handle.close()
+        try:
+            wav_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise AudioRecordingError("Audioaufnahme konnte nicht gestartet werden.") from exc
+
+    return AudioRecordingSession(
+        wav_path=wav_path,
+        mp3_path=mp3_path,
+        source_name=selected_source,
+        source_label=source_label,
+        card_name=card_name,
+        previous_card_profile=previous_card_profile,
+        switched_card_profile=switched_card_profile,
+        process=process,
+        wav_handle=wav_handle,
+        started_at=float(time_fn()),
+    )
+
+
+def stop_audio_recording(
+    session: AudioRecordingSession,
+    *,
+    command_runner=subprocess.run,
+    timeout_secs: float = 10.0,
+) -> Path:
+    LOGGER.warning(
+        "Audio recording stop requested source=%s wav=%s mp3=%s",
+        session.source_name or "-",
+        session.wav_path,
+        session.mp3_path,
+    )
+    try:
+        if session.process.poll() is None:
+            session.process.terminate()
+        _, stderr_data = session.process.communicate(timeout=timeout_secs)
+    except subprocess.TimeoutExpired as exc:
+        session.process.kill()
+        session.process.communicate()
+        raise AudioRecordingError("Audioaufnahme liess sich nicht sauber beenden.") from exc
+    finally:
+        try:
+            session.wav_handle.close()
+        except Exception:
+            pass
+
+    restore_audio_card_profile(session, command_runner=command_runner)
+
+    if session.process.returncode not in (0, -15, 143):
+        stderr_text = ""
+        if isinstance(stderr_data, bytes):
+            stderr_text = stderr_data.decode("utf-8", errors="ignore").strip()
+        elif isinstance(stderr_data, str):
+            stderr_text = stderr_data.strip()
+        message = "Audioaufnahme ist fehlgeschlagen."
+        if stderr_text:
+            message = f"Audioaufnahme ist fehlgeschlagen: {stderr_text}"
+        raise AudioRecordingError(message)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise AudioRecordingError("`ffmpeg` ist nicht installiert. MP3-Konvertierung nicht möglich.")
+
+    wav_size = session.wav_path.stat().st_size if session.wav_path.exists() else -1
+    LOGGER.warning(
+        "Audio recording stopped returncode=%s wav_exists=%s wav_size_bytes=%s",
+        session.process.returncode,
+        session.wav_path.exists(),
+        wav_size,
+    )
+
+    try:
+        LOGGER.warning("Audio MP3 conversion start input=%s output=%s", session.wav_path, session.mp3_path)
+        ffmpeg_command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(session.wav_path),
+        ]
+        rnnoise_model = discover_rnnoise_model()
+        if rnnoise_model is not None:
+            ffmpeg_command.extend(["-af", f"arnndn=model={rnnoise_model}"])
+            LOGGER.warning("Audio RNNoise enabled model=%s", rnnoise_model)
+        else:
+            LOGGER.warning(
+                "Audio RNNoise model not found; skipping denoise. checked=%s",
+                ",".join(RNNOISE_MODEL_CANDIDATES),
+            )
+        ffmpeg_command.extend(
+            [
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "4",
+                str(session.mp3_path),
+            ]
+        )
+        command_runner(
+            ffmpeg_command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AudioRecordingError("MP3-Konvertierung ist fehlgeschlagen.") from exc
+
+    mp3_size = session.mp3_path.stat().st_size if session.mp3_path.exists() else -1
+    LOGGER.warning(
+        "Audio MP3 conversion finished output=%s exists=%s size_bytes=%s",
+        session.mp3_path,
+        session.mp3_path.exists(),
+        mp3_size,
+    )
+    return session.mp3_path
+
+
+def cleanup_audio_recording(session: AudioRecordingSession) -> None:
+    for path in (session.wav_path, session.mp3_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            continue
+
+
+def restore_audio_card_profile(session: AudioRecordingSession, *, command_runner=subprocess.run) -> None:
+    if not session.switched_card_profile or not session.card_name or not session.previous_card_profile:
+        return
+    try:
+        LOGGER.warning(
+            "Restoring bluetooth card %s to profile %s after recording",
+            session.card_name,
+            session.previous_card_profile,
+        )
+        _run_audio_command(
+            ["pactl", "set-card-profile", session.card_name, session.previous_card_profile],
+            command_runner=command_runner,
+        )
+    except (OSError, subprocess.SubprocessError):
+        LOGGER.exception("Failed to restore bluetooth card profile for %s", session.card_name)
+
+
+def transcribe_audio_file(
+    audio_path: Path,
+    *,
+    base_url: str,
+    http_post=requests.post,
+) -> str:
+    if not audio_path.exists():
+        raise AudioTranscriptionError("Audiodatei wurde nicht gefunden.")
+
+    request_url = whisper_transcribe_url(base_url)
+    started_at = time.time()
+    LOGGER.warning(
+        "Whisper request url=%s file=%s size_bytes=%s",
+        request_url,
+        audio_path.name,
+        audio_path.stat().st_size,
+    )
+    try:
+        with audio_path.open("rb") as handle:
+            response = http_post(
+                request_url,
+                files={"file": (audio_path.name, handle, "audio/mpeg")},
+                headers={"User-Agent": f"{APP_ID}/audio-transcribe"},
+                timeout=(WHISPER_CONNECT_TIMEOUT_SECS, WHISPER_READ_TIMEOUT_SECS),
+            )
+        response.raise_for_status()
+    except requests.Timeout as exc:
+        LOGGER.exception("Whisper request timeout url=%s", request_url)
+        raise AudioTranscriptionError("Whisper hat nicht rechtzeitig geantwortet.") from exc
+    except requests.ConnectionError as exc:
+        LOGGER.exception("Whisper connection failed url=%s", request_url)
+        raise AudioTranscriptionError("Keine Verbindung zum Whisper-Dienst.") from exc
+    except requests.HTTPError as exc:
+        LOGGER.exception(
+            "Whisper HTTP error url=%s status=%s body=%s",
+            request_url,
+            getattr(getattr(exc, "response", None), "status_code", "?"),
+            str(getattr(getattr(exc, "response", None), "text", "") or "")[:1000],
+        )
+        raise AudioTranscriptionError(
+            f"Whisper hat die Anfrage abgelehnt (HTTP {getattr(getattr(exc, 'response', None), 'status_code', '?')})."
+        ) from exc
+    except requests.RequestException as exc:
+        LOGGER.exception("Whisper request failed url=%s", request_url)
+        raise AudioTranscriptionError("Whisper-Anfrage ist fehlgeschlagen.") from exc
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    LOGGER.warning(
+        "Whisper response url=%s status=%s content_type=%s elapsed_ms=%s",
+        request_url,
+        getattr(response, "status_code", "?"),
+        content_type or "-",
+        elapsed_ms,
+    )
+    if "application/json" in content_type:
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            LOGGER.exception("Whisper response JSON decode failed url=%s", request_url)
+            raise AudioTranscriptionError("Whisper lieferte ungueltiges JSON.") from exc
+        LOGGER.warning("Whisper JSON payload=%s", json.dumps(payload, ensure_ascii=False)[:2000])
+        if isinstance(payload, dict):
+            for key in ("text", "transcript", "result"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    LOGGER.warning("Whisper transcript text=%s", value.strip()[:2000])
+                    return value.strip()
+        raise AudioTranscriptionError("Whisper lieferte keinen Transkript-Text.")
+
+    text = str(getattr(response, "text", "") or "").strip()
+    if text:
+        LOGGER.warning("Whisper text payload=%s", text[:2000])
+        return text
+    raise AudioTranscriptionError("Whisper lieferte keinen Transkript-Text.")
 
 
 def ollama_generate_url(base_url: str) -> str:

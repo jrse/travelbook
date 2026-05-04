@@ -1,36 +1,75 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from datetime import date
 from pathlib import Path
 
 from travelbook_core import Poi, compute_runtime_indicators, format_fix_age
 from travelbook_services import (
+    AudioRecordingSession,
+    AudioTranscriptionError,
+    DiaryImproveError,
     PoiFetchError,
+    average_speed_mps,
     assign_clusters,
     calculate_speed_mps,
     calculate_navigation_info,
+    cleanup_audio_recording,
+    describe_audio_input_source,
+    discover_rnnoise_model,
+    discover_bluetooth_input_source,
+    detect_travel_mode,
     derive_travel_heading,
     effective_query_radius,
     extract_poi_url,
     fetch_pois,
+    improve_diary_entry,
+    is_city_poi,
     load_diary_entries,
+    load_app_settings,
+    ollama_generate_url,
     poi_refresh_distance,
     poi_refresh_interval,
     resolve_region,
+    save_app_settings,
     save_diary_entries,
+    start_audio_recording,
+    stop_audio_recording,
     should_refresh_pois,
+    transcribe_audio_file,
+    trim_location_samples,
+    whisper_transcribe_url,
+    ensure_bluetooth_input_source,
 )
 
 
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
+        self.text = ""
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/json"}
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self.payload
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(())
+
+    def close(self):
+        return None
+
+
+def extract_query(data):
+    if isinstance(data, dict):
+        return data.get("data", "")
+    if isinstance(data, bytes):
+        return data.decode("utf-8")
+    return str(data)
 
 
 class TestServices(unittest.TestCase):
@@ -95,6 +134,291 @@ class TestServices(unittest.TestCase):
             loaded = load_diary_entries(base_dir, day)
 
             self.assertEqual(entries, loaded)
+
+    def test_app_settings_roundtrip_persists_ollama_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            save_app_settings(
+                base_dir,
+                {
+                    "ollama_base_url": "http://192.168.178.48",
+                    "ollama_diary_system_prompt": "rewrite diary entries",
+                    "whisper_base_url": "http://192.168.178.153:8000",
+                },
+            )
+
+            loaded = load_app_settings(base_dir)
+
+            self.assertEqual("http://192.168.178.48", loaded["ollama_base_url"])
+            self.assertEqual("rewrite diary entries", loaded["ollama_diary_system_prompt"])
+            self.assertEqual("http://192.168.178.153:8000", loaded["whisper_base_url"])
+
+    def test_ollama_generate_url_accepts_plain_and_api_base_urls(self):
+        self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48"))
+        self.assertEqual("http://192.168.178.48/api/generate", ollama_generate_url("http://192.168.178.48/api"))
+
+    def test_whisper_transcribe_url_appends_default_endpoint_only_for_bare_host(self):
+        self.assertEqual("http://192.168.178.153:8000/transcribe", whisper_transcribe_url("http://192.168.178.153:8000"))
+        self.assertEqual(
+            "http://192.168.178.153:8000/api/transcribe",
+            whisper_transcribe_url("http://192.168.178.153:8000/api/transcribe"),
+        )
+
+    def test_discover_bluetooth_input_source_prefers_bluez_source(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: alsa_input.platform-device.analog-stereo\n"
+                "\tDescription: Internal Mic\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"alsa\"\n"
+                "Source #2\n"
+                "\tName: bluez_input.00_11_22_33_44_55.0\n"
+                "\tDescription: Jabra Elite 45h\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            )
+        )
+
+        source = discover_bluetooth_input_source(command_runner=lambda *_args, **_kwargs: result)
+
+        self.assertEqual("bluez_input.00_11_22_33_44_55.0", source)
+
+    def test_discover_bluetooth_input_source_ignores_monitor_sources(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: bluez_sink.FA_1B_A3_7D_14_E7.a2dp_sink.monitor\n"
+                "\tDescription: Monitor of Intenso Buds Plus\n"
+                "\tdevice.class = \"monitor\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            )
+        )
+
+        source = discover_bluetooth_input_source(command_runner=lambda *_args, **_kwargs: result)
+
+        self.assertIsNone(source)
+
+    def test_describe_audio_input_source_prefers_pactl_description(self):
+        result = SimpleNamespace(
+            stdout=(
+                "Source #1\n"
+                "\tName: bluez_input.00_11_22_33_44_55.0\n"
+                "\tDescription: Jabra Elite 45h\n"
+            )
+        )
+
+        label = describe_audio_input_source(
+            "bluez_input.00_11_22_33_44_55.0",
+            command_runner=lambda *_args, **_kwargs: result,
+        )
+
+        self.assertEqual("Jabra Elite 45h", label)
+
+    def test_describe_audio_input_source_formats_bluez_name_without_pactl_details(self):
+        label = describe_audio_input_source(
+            "bluez_input.00_11_22_33_44_55.0",
+            command_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("missing pactl")),
+        )
+
+        self.assertEqual("00 11 22 33 44 55 0", label)
+
+    def test_discover_rnnoise_model_returns_first_existing_candidate(self):
+        with patch("travelbook_services.RNNOISE_MODEL_CANDIDATES", ("/missing.rnnn", "/present.rnnn")):
+            with patch.object(Path, "exists", new=lambda path: str(path) == "/present.rnnn"):
+                model = discover_rnnoise_model()
+
+        self.assertEqual(Path("/present.rnnn"), model)
+
+    def test_start_and_stop_audio_recording_uses_parec_and_converts_to_mp3(self):
+        commands = []
+
+        class FakeProcess:
+            def __init__(self, command):
+                self.command = command
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.returncode = -15
+
+            def communicate(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return ("", "")
+
+        def fake_popen(command, stdout=None, stderr=None):
+            commands.append(command)
+            self.assertIsNotNone(stdout)
+            self.assertIsNotNone(stderr)
+            return FakeProcess(command)
+
+        source_details = (
+            "Source #1\n"
+            "\tName: bluez_input.headset\n"
+            "\tDescription: Headset\n"
+            "\tdevice.class = \"sound\"\n"
+            "\tdevice.api = \"bluez\"\n"
+        )
+
+        def fake_run(command, check=None, capture_output=None, text=None):
+            commands.append(command)
+            if command == ["pactl", "list", "sources"]:
+                return SimpleNamespace(stdout=source_details)
+            if command == ["pactl", "list", "cards"]:
+                return SimpleNamespace(stdout="")
+            return SimpleNamespace(stdout="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("travelbook_services.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                with patch("travelbook_services.discover_rnnoise_model", return_value=Path("/models/rnnoise.rnnn")):
+                    session = start_audio_recording(
+                        Path(tmp),
+                        source_name="bluez_input.headset",
+                        popen_factory=fake_popen,
+                        command_runner=fake_run,
+                    )
+                    mp3_path = stop_audio_recording(session, command_runner=fake_run)
+
+                    self.assertEqual(".mp3", mp3_path.suffix)
+                    self.assertEqual(["pactl", "list", "sources"], commands[0])
+                    self.assertIn("--device=bluez_input.headset", commands[1])
+                    self.assertEqual("Headset", session.source_label)
+                    self.assertEqual("/usr/bin/ffmpeg", commands[2][0])
+                    self.assertIn("arnndn=model=/models/rnnoise.rnnn", commands[2])
+                    cleanup_audio_recording(session)
+
+    def test_ensure_bluetooth_input_source_switches_card_profile_when_only_a2dp_monitor_exists(self):
+        commands = []
+        source_outputs = [
+            (
+                "Source #1\n"
+                "\tName: bluez_sink.FA_1B_A3_7D_14_E7.a2dp_sink.monitor\n"
+                "\tDescription: Monitor of Intenso Buds Plus\n"
+                "\tdevice.class = \"monitor\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            ),
+            (
+                "Source #1\n"
+                "\tName: bluez_input.FA_1B_A3_7D_14_E7.handsfree_head_unit\n"
+                "\tDescription: Intenso Buds Plus\n"
+                "\tdevice.class = \"sound\"\n"
+                "\tdevice.api = \"bluez\"\n"
+            ),
+        ]
+        source_index = {"value": 0}
+        cards_output = (
+            "Card #0\n"
+            "\tName: bluez_card.FA_1B_A3_7D_14_E7\n"
+            "\tdevice.description = \"Intenso Buds Plus\"\n"
+            "\tbluez.alias = \"Intenso Buds Plus\"\n"
+            "\tActive Profile: a2dp_sink\n"
+            "\tProfiles:\n"
+            "\t\ta2dp_sink: High Fidelity Playback (A2DP Sink)\n"
+            "\t\thandsfree_head_unit: Handsfree Head Unit (HFP)\n"
+        )
+
+        def fake_run(command, check=None, capture_output=None, text=None):
+            commands.append(command)
+            if command == ["pactl", "list", "sources"]:
+                value = source_outputs[min(source_index["value"], len(source_outputs) - 1)]
+                if source_index["value"] == 0:
+                    source_index["value"] += 1
+                return SimpleNamespace(stdout=value)
+            if command == ["pactl", "list", "short", "sources"]:
+                return SimpleNamespace(stdout="")
+            if command == ["pactl", "list", "cards"]:
+                return SimpleNamespace(stdout=cards_output)
+            if command == ["pactl", "set-card-profile", "bluez_card.FA_1B_A3_7D_14_E7", "handsfree_head_unit"]:
+                return SimpleNamespace(stdout="")
+            raise AssertionError(command)
+
+        with patch("travelbook_services.time.sleep", return_value=None):
+            source_name, card_name, previous_profile, switched = ensure_bluetooth_input_source(command_runner=fake_run)
+
+        self.assertEqual("bluez_input.FA_1B_A3_7D_14_E7.handsfree_head_unit", source_name)
+        self.assertEqual("bluez_card.FA_1B_A3_7D_14_E7", card_name)
+        self.assertEqual("a2dp_sink", previous_profile)
+        self.assertEqual(True, switched)
+        self.assertIn(["pactl", "set-card-profile", "bluez_card.FA_1B_A3_7D_14_E7", "handsfree_head_unit"], commands)
+
+    def test_transcribe_audio_file_reads_text_from_json_response(self):
+        calls = {}
+
+        def fake_post(url, files=None, headers=None, timeout=None):
+            calls["url"] = url
+            calls["files"] = files
+            calls["headers"] = headers
+            calls["timeout"] = timeout
+            return FakeResponse({"text": "Heute war ich unterwegs."})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "entry.mp3"
+            audio_path.write_bytes(b"mp3")
+
+            transcript = transcribe_audio_file(audio_path, base_url="http://192.168.178.153:8000", http_post=fake_post)
+
+            self.assertEqual("Heute war ich unterwegs.", transcript)
+            self.assertEqual("http://192.168.178.153:8000/transcribe", calls["url"])
+            self.assertEqual("audio/mpeg", calls["files"]["file"][2])
+
+    def test_transcribe_audio_file_raises_when_text_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "entry.mp3"
+            audio_path.write_bytes(b"mp3")
+
+            with self.assertRaises(AudioTranscriptionError):
+                transcribe_audio_file(
+                    audio_path,
+                    base_url="http://192.168.178.153:8000",
+                    http_post=lambda *_args, **_kwargs: FakeResponse({"segments": []}),
+                )
+
+    def test_improve_diary_entry_accumulates_streamed_response(self):
+        calls = {}
+
+        class FakeStreamResponse(FakeResponse):
+            def iter_lines(self, decode_unicode=False):
+                lines = [
+                    '{"response":"Heute bin ich","done":false}',
+                    '{"response":" durch die Stadt gelaufen.","done":false}',
+                    '{"done":true}',
+                ]
+                return iter(lines)
+
+        def fake_post(url, json=None, **kwargs):
+            calls["url"] = url
+            calls["json"] = json
+            calls["kwargs"] = kwargs
+            return FakeStreamResponse({})
+
+        improved = improve_diary_entry(
+            "today i walked through the city",
+            base_url="http://192.168.178.48",
+            system_prompt="fix diary entry",
+            http_post=fake_post,
+        )
+
+        self.assertEqual("Heute bin ich durch die Stadt gelaufen.", improved)
+        self.assertEqual("http://192.168.178.48/api/generate", calls["url"])
+        self.assertEqual(False, calls["json"]["think"])
+        self.assertEqual(True, calls["json"]["stream"])
+        self.assertEqual(240, calls["json"]["options"]["num_predict"])
+
+    def test_improve_diary_entry_raises_on_empty_stream_response(self):
+        class EmptyStreamResponse(FakeResponse):
+            def iter_lines(self, decode_unicode=False):
+                return iter(['{"done":true}'])
+
+        with self.assertRaises(DiaryImproveError):
+            improve_diary_entry(
+                "today",
+                base_url="http://192.168.178.48",
+                system_prompt="fix diary entry",
+                http_post=lambda *_args, **_kwargs: EmptyStreamResponse({}),
+            )
 
     def test_fetch_pois_retries_timeout_then_succeeds(self):
         import requests
@@ -163,6 +487,132 @@ class TestServices(unittest.TestCase):
             )
         self.assertIn("Netzwerkverbindung", ctx.exception.user_message)
 
+    def test_fetch_pois_batches_large_filter_sets_and_deduplicates_results(self):
+        calls = {"queries": []}
+        categories = {f'"amenity"="test_{index}"': True for index in range(30)}
+        filter_lookup = {("amenity", f"test_{index}"): f'"amenity"="test_{index}"' for index in range(30)}
+        labels = {f'"amenity"="test_{index}"': f"Test {index}" for index in range(30)}
+
+        def fake_post(_url, data=None, **_kwargs):
+            calls["queries"].append(extract_query(data))
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Cafe", "amenity": "test_0"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+        self.assertEqual(2, len(calls["queries"]))
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Cafe", pois[0].name)
+
+    def test_fetch_pois_only_queries_selected_categories_without_city_expansion(self):
+        calls = {"queries": []}
+        categories = {
+            '"amenity"="cafe"': True,
+            '"tourism"="hotel"': False,
+            '"place"="city"': False,
+        }
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+
+        def fake_post(_url, data=None, **_kwargs):
+            calls["queries"].append(extract_query(data))
+            return FakeResponse({"elements": []})
+
+        fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, include_cities=False, http_post=fake_post)
+
+        self.assertEqual(1, len(calls["queries"]))
+        self.assertIn('nwr["amenity"="cafe"](around:1000,48.1,11.6);', calls["queries"][0])
+        self.assertNotIn('nwr["place"="city"](around:1000,48.1,11.6);', calls["queries"][0])
+
+    def test_fetch_pois_splits_406_batches_and_still_returns_results(self):
+        import requests
+
+        calls = {"queries": []}
+        categories = {f'"amenity"="test_{index}"': True for index in range(4)}
+        filter_lookup = {("amenity", f"test_{index}"): f'"amenity"="test_{index}"' for index in range(4)}
+        labels = {f'"amenity"="test_{index}"': f"Test {index}" for index in range(4)}
+
+        class Fake406Response:
+            status_code = 406
+
+        def fake_post(_url, data=None, **_kwargs):
+            query = extract_query(data)
+            calls["queries"].append(query)
+            if query.count("nwr[") > 1:
+                raise requests.HTTPError(response=Fake406Response())
+            test_index = int(query.split('test_')[1].split('"')[0])
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": test_index,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Split OK", "amenity": "test_0"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertGreater(len(calls["queries"]), 1)
+        self.assertEqual(4, len(pois))
+
+    def test_fetch_pois_logs_query_text(self):
+        categories = {'"amenity"="cafe"': True}
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+
+        def fake_post(_url, data=None, **_kwargs):
+            return FakeResponse({"elements": []})
+
+        with patch("travelbook_services.LOGGER.warning") as warning:
+            fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertEqual(2, warning.call_count)
+        log_args = warning.call_args_list[0][0]
+        self.assertEqual("POI query lat=%s lon=%s radius=%s filter_count=%s filters=%s\n%s", log_args[0])
+        self.assertEqual(48.1, log_args[1])
+        self.assertEqual(11.6, log_args[2])
+        self.assertEqual(1000, log_args[3])
+        self.assertEqual(1, log_args[4])
+        self.assertEqual(['"amenity"="cafe"'], log_args[5])
+        self.assertIn('nwr["amenity"="cafe"](around:1000,48.1,11.6);', log_args[6])
+        response_log_args = warning.call_args_list[1][0]
+        self.assertEqual("POI response status=%s body=%s", response_log_args[0])
+
+    def test_fetch_pois_posts_query_using_data_form_field_and_headers(self):
+        categories = {'"amenity"="cafe"': True}
+        filter_lookup = {("amenity", "cafe"): '"amenity"="cafe"'}
+        labels = {'"amenity"="cafe"': "Cafes"}
+        request_args = {}
+
+        def fake_post(_url, data=None, headers=None, **_kwargs):
+            request_args["data"] = data
+            request_args["headers"] = headers
+            return FakeResponse({"elements": []})
+
+        fetch_pois(48.1, 11.6, 1000, categories, filter_lookup, labels, http_post=fake_post)
+
+        self.assertEqual(
+            '[out:json][timeout:20];(nwr["amenity"="cafe"](around:1000,48.1,11.6););out center tags;',
+            request_args["data"]["data"],
+        )
+        self.assertEqual("application/json,text/plain;q=0.9,*/*;q=0.8", request_args["headers"]["Accept"])
+        self.assertIn("/poi-fetch", request_args["headers"]["User-Agent"])
+
     def test_poi_refresh_distance_scales_with_radius_but_stays_bounded(self):
         self.assertEqual(75.0, poi_refresh_distance(100))
         self.assertEqual(250.0, poi_refresh_distance(2000))
@@ -177,6 +627,29 @@ class TestServices(unittest.TestCase):
         )
         self.assertEqual(5.0, speed)
 
+    def test_trim_location_samples_keeps_recent_window_only(self):
+        samples = [
+            (100.0, (48.1, 11.6)),
+            (250.0, (48.2, 11.6)),
+            (410.0, (48.3, 11.6)),
+        ]
+
+        trimmed = trim_location_samples(samples, 120.0, now_ts=410.0)
+        self.assertEqual([(410.0, (48.3, 11.6))], trimmed)
+
+    def test_average_speed_mps_uses_window_endpoints(self):
+        samples = [
+            (100.0, (48.1, 11.6)),
+            (200.0, (48.2, 11.6)),
+            (300.0, (48.3, 11.6)),
+        ]
+        speed = average_speed_mps(samples, 300.0, distance_fn=lambda *_args: 600.0)
+        self.assertEqual(3.0, speed)
+
+    def test_detect_travel_mode_switches_to_drive_on_high_average_speed(self):
+        self.assertEqual("drive", detect_travel_mode(1.0, 4.5))
+        self.assertEqual("pedestrian", detect_travel_mode(2.0, 2.5))
+
     def test_poi_refresh_interval_shortens_when_speed_increases(self):
         slow = poi_refresh_interval(1000, 2.0)
         fast = poi_refresh_interval(1000, 20.0)
@@ -188,6 +661,9 @@ class TestServices(unittest.TestCase):
         self.assertEqual(1000, effective_query_radius(1000, 2000, 1.0))
         self.assertEqual(1600, effective_query_radius(1000, 2000, 20.0))
         self.assertEqual(2000, effective_query_radius(1000, 2000, 80.0))
+
+    def test_effective_query_radius_uses_larger_drive_mode_base(self):
+        self.assertEqual(5000, effective_query_radius(1000, 2000, 1.0, "drive"))
 
     def test_should_refresh_pois_requires_significant_movement(self):
         close_by = (48.1003, 11.6000)
@@ -258,6 +734,86 @@ class TestServices(unittest.TestCase):
         self.assertEqual(10.0, bearing)
         self.assertEqual(350.0, heading)
         self.assertEqual(20.0, turn)
+
+    def test_fetch_pois_can_include_cities_in_general_results(self):
+        def fake_post(*_args, **_kwargs):
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Village Center", "place": "village"},
+                        }
+                    ]
+                }
+            )
+
+        pois = fetch_pois(
+            48.1,
+            11.6,
+            5000,
+            {},
+            {},
+            {},
+            include_cities=True,
+            http_post=fake_post,
+            sleep_fn=lambda _seconds: None,
+        )
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Staedte", pois[0].category_label)
+        self.assertEqual("place:village", pois[0].category)
+        self.assertTrue(is_city_poi(pois[0]))
+
+    def test_fetch_pois_can_limit_drive_mode_to_cities_only(self):
+        def fake_post(*_args, **_kwargs):
+            return FakeResponse(
+                {
+                    "elements": [
+                        {
+                            "type": "node",
+                            "id": 1,
+                            "lat": 48.1,
+                            "lon": 11.6,
+                            "tags": {"name": "Village Center", "place": "village"},
+                        },
+                        {
+                            "type": "node",
+                            "id": 2,
+                            "lat": 48.1002,
+                            "lon": 11.6002,
+                            "tags": {"name": "Cafe", "amenity": "cafe"},
+                        },
+                    ]
+                }
+            )
+
+        pois = fetch_pois(
+            48.1,
+            11.6,
+            5000,
+            {'"place"="city"': True, '"place"="town"': True, '"place"="village"': True, '"amenity"="cafe"': True},
+            {
+                ("place", "city"): '"place"="city"',
+                ("place", "town"): '"place"="town"',
+                ("place", "village"): '"place"="village"',
+                ("amenity", "cafe"): '"amenity"="cafe"',
+            },
+            {
+                '"place"="city"': "Staedte",
+                '"place"="town"': "Staedte",
+                '"place"="village"': "Staedte",
+                '"amenity"="cafe"': "Cafes",
+            },
+            city_only=True,
+            http_post=fake_post,
+            sleep_fn=lambda _seconds: None,
+        )
+        self.assertEqual(1, len(pois))
+        self.assertEqual("Village Center", pois[0].name)
+        self.assertTrue(is_city_poi(pois[0]))
 
     def test_derive_travel_heading_returns_bearing_for_significant_movement(self):
         heading = derive_travel_heading(

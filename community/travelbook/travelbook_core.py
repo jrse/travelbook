@@ -15,6 +15,7 @@ CANVAS_PADDING = 600
 MIN_ZOOM = 0.35
 MAX_ZOOM = 3.0
 RADAR_TILE_OPACITY = 0.18
+RADAR_TILE_OPACITY_DRIVE = 0.34
 RADAR_TILE_SIZE = 256
 RADAR_TILE_ZOOM_MIN = 12
 RADAR_TILE_ZOOM_MAX = 17
@@ -28,6 +29,17 @@ OLLAMA_DIARY_MODEL = "qwen3:8b"
 OLLAMA_DIARY_MAX_TOKENS = 240
 OLLAMA_CONNECT_TIMEOUT_SECS = 5
 OLLAMA_READ_TIMEOUT_SECS = 90
+WHISPER_BASE_URL_DEFAULT = "http://192.168.178.153:8000"
+WHISPER_CONNECT_TIMEOUT_SECS = 5
+WHISPER_READ_TIMEOUT_SECS = 180
+RECORDER_SAMPLE_RATE = 16000
+RECORDER_CHANNELS = 1
+RNNOISE_MODEL_CANDIDATES = (
+    "/usr/share/ffmpeg/librnnoise.rnnn",
+    "/usr/share/ffmpeg/rnnoise.rnnn",
+    "/usr/share/rnnoise/rnnoise-model.rnnn",
+    "/usr/share/rnnoise/model.rnnn",
+)
 OLLAMA_DIARY_SYSTEM_PROMPT_DEFAULT = (
     "Correct spelling and grammar, rewrite as a concise first-person diary entry, "
     "return only the diary text, and keep it under 240 tokens."
