@@ -51,13 +51,20 @@ jobs:
 
     steps:
       - name: Install packaging tools
-        run: apk add --no-cache alpine-sdk bash
+        run: apk add --no-cache alpine-sdk bash su-exec
 
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare abuild user
+        run: |
+          adduser -D builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
       - name: Validate APKBUILD checksums
         run: |
-          cd community/travelbook
-          abuild checksum
-          git diff --exit-code APKBUILD
+          su-exec builder sh -lc '
+            cd "$GITHUB_WORKSPACE/community/travelbook"
+            abuild checksum
+            git diff --exit-code APKBUILD
+          '
